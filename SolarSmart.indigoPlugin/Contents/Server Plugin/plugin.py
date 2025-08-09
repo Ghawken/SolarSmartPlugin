@@ -373,9 +373,24 @@ class SolarSmartAsyncManager:
             if dbg: log.debug(f"_render_table_png: emoji font fallback to mono: {e}")
 
         # Helper: draw text; omit fill for emoji font to preserve native color
-        def draw_text(drw: ImageDraw.ImageDraw, xy, text, font, color):
-            if font is emoji_font:
-                drw.text(xy, text, font=font)  # no fill -> native emoji color
+        def _is_emoji_font(font) -> bool:
+            # Detect Apple Color Emoji or Noto Color Emoji by path/name
+            path = getattr(font, "path", "") or ""
+            base = os.path.basename(path).lower()
+            return "emoji" in base or "color" in base  # e.g., "Apple Color Emoji.ttc", "NotoColorEmoji.ttf"
+
+        def draw_text(drw, xy, text, font, color):
+            """
+            Draw text; for emoji fonts, preserve native color by:
+            - omitting 'fill'
+            - enabling embedded_color=True (if Pillow supports it)
+            """
+            if _is_emoji_font(font):
+                try:
+                    drw.text(xy, text, font=font, embedded_color=True)  # <-- keep emoji color
+                except TypeError:
+                    # Older Pillow: parameter not supported; still omit fill for best chance
+                    drw.text(xy, text, font=font)
             else:
                 drw.text(xy, text, font=font, fill=color)
 
@@ -896,14 +911,17 @@ class SolarSmartAsyncManager:
         return bool(self.plugin._load_state.get(dev.id, {}).get("running", False))
 
     def _mark_running(self, dev: indigo.Device, running: bool):
-        st = self.plugin._load_state.setdefault(dev.id, {})
-        st["running"] = running
+        st = self._load_state.setdefault(dev.id, {})
         if running:
-            st.setdefault("start_ts", time.time())
+            st["start_ts"] = time.time()
+            dev.updateStateOnServer("LastStartTs", f"{st['start_ts']:.3f}")
+            dev.updateStateOnServer("IsRunning", True)
+            dev.updateStateOnServer("Status", "RUNNING")
         else:
-            st.pop("start_ts", None)
-            # set cooldown start
-            st["cooldown_start"] = time.time()
+            st["start_ts"] = None
+            dev.updateStateOnServer("LastStartTs", "")
+            dev.updateStateOnServer("IsRunning", False)
+            dev.updateStateOnServer("Status", "OFF")
 
     def _served_quota_mins(self, dev: indigo.Device) -> int:
         st = self.plugin._load_state.setdefault(dev.id, {})
@@ -972,30 +990,28 @@ class SolarSmartAsyncManager:
         }.get((period or "24h").lower(), 24 * 60)
 
     def _ensure_quota_anchor(self, dev, props, now_ts: float):
-        """
-        Ensure the quota accounting anchor exists and is fresh.
-        If the horizon has rolled over, reset served minutes & device states.
-        """
-        st = self.plugin._load_state.setdefault(dev.id, {})
+        st = self._load_state.setdefault(dev.id, {})
         period = (props.get("quotaWindow") or "24h").lower()
         horizon_mins = self._quota_horizon_minutes(period)
         anchor = st.get("quota_anchor_ts")
 
-        if (anchor is None) or ((now_ts - anchor) >= (horizon_mins * 60)):
+        # First-time: set anchor, do NOT reset minutes
+        if anchor is None:
+            st["quota_anchor_ts"] = now_ts
+            dev.updateStateOnServer("QuotaAnchorTs", f"{now_ts:.3f}")
+            return
+
+        # Rollover: reset minutes only if horizon passed
+        if (now_ts - anchor) >= (horizon_mins * 60):
             st["quota_anchor_ts"] = now_ts
             st["served_quota_mins"] = 0
-            # Reset visible device counters
-            try:
-                dev.updateStateOnServer("RuntimeQuotaMins", 0)  # RunMin
-                # Reset RemainingQuotaMins to the configured target (if set)
-                target = int(props.get("maxRuntimePerQuotaMins") or 0)
-                dev.updateStateOnServer("RemainingQuotaMins", target if target > 0 else 0)
-                # Optional: window runtime is per “allowed window”; reset here too
-                dev.updateStateOnServer("RuntimeWindowMins", 0)
-            except Exception:
-                pass
-
-
+            dev.updateStateOnServer("QuotaAnchorTs", f"{now_ts:.3f}")
+            dev.updateStateOnServer("RuntimeQuotaMins", 0)
+            target = int(props.get("maxRuntimePerQuotaMins") or 0)
+            dev.updateStateOnServer("RemainingQuotaMins", target if target > 0 else 0)
+            dev.updateStateOnServer("RuntimeWindowMins", 0)
+            if getattr(self, "debug2", False):
+                self.logger.debug(f"{dev.name}: quota window rolled over, counters reset")
 
     # ========== Actuation wrappers ==========
     def _ensure_on(self, dev: indigo.Device, reason: str):
@@ -1012,16 +1028,16 @@ class SolarSmartAsyncManager:
     def _ensure_off(self, dev: indigo.Device, reason: str):
         if not self._is_running(dev):
             return
-        self.plugin._execute_load_action(dev, turn_on=False, reason=reason)
-        # account served minutes since start
-        st = self.plugin._load_state.get(dev.id, {})
+        self._execute_load_action(dev, turn_on=False, reason=reason)
+        st = self._load_state.get(dev.id, {})
         ts = st.get("start_ts")
         if ts:
             mins = max(1, int(round((time.time() - ts) / 60.0)))
-            self._add_served_minutes(dev, mins)
+            self._add_served_minutes(dev, mins)  # this also updates RuntimeQuotaMins
+            # Recompute Remaining
+            props = dev.pluginProps or {}
+            self._quota_remaining_mins(dev, props, datetime.now())
         self._mark_running(dev, False)
-        dev.updateStateOnServer("IsRunning", False)
-        dev.updateStateOnServer("Status", "OFF")
         dev.updateStateOnServer("LastReason", reason)
 
 
@@ -1236,10 +1252,56 @@ class Plugin(indigo.PluginBase):
 
         return True
 
+    def _hydrate_load_state_from_device(self, dev: indigo.Device):
+        """Rebuild internal _load_state for a load from its persisted device states."""
+        if dev.deviceTypeId != "solarsmartLoad":
+            return
+        st = self._load_state.setdefault(dev.id, {})
+        try:
+            # Read persisted counters
+            st["served_quota_mins"] = int(dev.states.get("RuntimeQuotaMins", 0) or 0)
+            # Anchor & last start timestamps (strings -> floats or None)
+            q_ts = dev.states.get("QuotaAnchorTs", "")
+            st["quota_anchor_ts"] = float(q_ts) if q_ts not in ("", None) else None
+
+            s_ts = dev.states.get("LastStartTs", "")
+            st["start_ts"] = float(s_ts) if s_ts not in ("", None) else None
+
+            # Safety: never resume as 'running' after a restart
+            if dev.states.get("IsRunning", False):
+                dev.updateStateOnServer("IsRunning", False)
+                dev.updateStateOnServer("Status", "OFF")
+                dev.updateStateOnServer("LastReason", "Plugin restart recovery")
+
+            # Make RemainingQuotaMins consistent with props & RuntimeQuotaMins
+            props = dev.pluginProps or {}
+            target = int(props.get("maxRuntimePerQuotaMins") or 0)
+            remaining = max(0, target - st["served_quota_mins"]) if target > 0 else 0
+            dev.updateStateOnServer("RemainingQuotaMins", remaining)
+
+            # Ensure window runtime state exists (cosmetic)
+            if dev.states.get("RuntimeWindowMins", None) is None:
+                dev.updateStateOnServer("RuntimeWindowMins", 0)
+
+            # If no anchor yet, create one without wiping minutes
+            if st.get("quota_anchor_ts") is None:
+                now_ts = time.time()
+                st["quota_anchor_ts"] = now_ts
+                dev.updateStateOnServer("QuotaAnchorTs", f"{now_ts:.3f}")
+
+            if getattr(self, "debug2", False):
+                self.logger.debug(f"Hydrated load {dev.name}: served={st['served_quota_mins']}m, "
+                                  f"anchor={st['quota_anchor_ts']}, start_ts={st.get('start_ts')}")
+        except Exception:
+            self.logger.exception(f"Hydrate failed for {dev.name}")
+
     # Start 'em up.
     def deviceStartComm(self, dev):
         """Indigo calls this when a device (of any type) starts communication."""
         dev.stateListOrDisplayStateIdChanged()
+        if dev.deviceTypeId == "solarsmartLoad":
+            self._hydrate_load_state_from_device(device)
+
         if dev.deviceTypeId != "solarsmartMain":
             return
         if getattr(self, "debug2", False):
@@ -1269,6 +1331,10 @@ class Plugin(indigo.PluginBase):
         MAChome = os.path.expanduser("~") + "/"
         self.saveDirectory = MAChome + "Pictures/Indigo-smartSolar/"
         self.speakPath = os.path.join(self.pluginprefDirectory, "speak")
+
+        for d in indigo.devices.iter("self"):
+            if d.deviceTypeId == "solarsmartLoad" and d.enabled:
+                self._hydrate_load_state_from_device(d)
 
         try:
 
