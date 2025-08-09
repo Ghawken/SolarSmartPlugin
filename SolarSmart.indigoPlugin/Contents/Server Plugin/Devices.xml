@@ -341,6 +341,33 @@
       <TriggerLabel>Last decision reason changed</TriggerLabel>
       <ControlPageLabel>Reason</ControlPageLabel>
     </State>
+      <State id="RuntimeQuotaMins">
+    <ValueType>Integer</ValueType>
+    <TriggerLabel>Quota Minutes Used</TriggerLabel>
+    <ControlPageLabel>Quota Minutes Used</ControlPageLabel>
+  </State>
+  <State id="RemainingQuotaMins">
+    <ValueType>Integer</ValueType>
+    <TriggerLabel>Quota Minutes Remaining</TriggerLabel>
+    <ControlPageLabel>Quota Minutes Remaining</ControlPageLabel>
+  </State>
+  <State id="RuntimeWindowMins">
+    <ValueType>Integer</ValueType>
+    <TriggerLabel>Window Runtime Minutes</TriggerLabel>
+    <ControlPageLabel>Window Runtime Minutes</ControlPageLabel>
+  </State>
+
+  <!-- Timestamps we persist across restarts -->
+  <State id="QuotaAnchorTs">
+    <ValueType>String</ValueType>
+    <TriggerLabel>Quota Anchor (epoch)</TriggerLabel>
+    <ControlPageLabel>Quota Anchor (epoch)</ControlPageLabel>
+  </State>
+  <State id="LastStartTs">
+    <ValueType>String</ValueType>
+    <TriggerLabel>Last Start (epoch)</TriggerLabel>
+    <ControlPageLabel>Last Start (epoch)</ControlPageLabel>
+  </State>
   </States>
 </Device>
 

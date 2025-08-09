@@ -911,7 +911,7 @@ class SolarSmartAsyncManager:
         return bool(self.plugin._load_state.get(dev.id, {}).get("running", False))
 
     def _mark_running(self, dev: indigo.Device, running: bool):
-        st = self._load_state.setdefault(dev.id, {})
+        st = self.plugin._load_state.setdefault(dev.id, {})
         if running:
             st["start_ts"] = time.time()
             dev.updateStateOnServer("LastStartTs", f"{st['start_ts']:.3f}")
@@ -990,7 +990,7 @@ class SolarSmartAsyncManager:
         }.get((period or "24h").lower(), 24 * 60)
 
     def _ensure_quota_anchor(self, dev, props, now_ts: float):
-        st = self._load_state.setdefault(dev.id, {})
+        st = self.plugin._load_state.setdefault(dev.id, {})
         period = (props.get("quotaWindow") or "24h").lower()
         horizon_mins = self._quota_horizon_minutes(period)
         anchor = st.get("quota_anchor_ts")
@@ -1011,7 +1011,7 @@ class SolarSmartAsyncManager:
             dev.updateStateOnServer("RemainingQuotaMins", target if target > 0 else 0)
             dev.updateStateOnServer("RuntimeWindowMins", 0)
             if getattr(self, "debug2", False):
-                self.logger.debug(f"{dev.name}: quota window rolled over, counters reset")
+                self.plugin.logger.debug(f"{dev.name}: quota window rolled over, counters reset")
 
     # ========== Actuation wrappers ==========
     def _ensure_on(self, dev: indigo.Device, reason: str):
@@ -1029,7 +1029,7 @@ class SolarSmartAsyncManager:
         if not self._is_running(dev):
             return
         self._execute_load_action(dev, turn_on=False, reason=reason)
-        st = self._load_state.get(dev.id, {})
+        st = self.plugin._load_state.get(dev.id, {})
         ts = st.get("start_ts")
         if ts:
             mins = max(1, int(round((time.time() - ts) / 60.0)))
@@ -1083,6 +1083,8 @@ class Plugin(indigo.PluginBase):
         self.logger.info(u"{0:=^130}".format(""))
 
         self.triggers = {}
+        # Internal in-memory map: { device.id: { state data } }
+        self._load_state = {}
 
         # Change to logging
         pfmt = logging.Formatter('%(asctime)s.%(msecs)03d\t[%(levelname)8s] %(name)20s.%(funcName)-25s%(msg)s',
@@ -1300,7 +1302,7 @@ class Plugin(indigo.PluginBase):
         """Indigo calls this when a device (of any type) starts communication."""
         dev.stateListOrDisplayStateIdChanged()
         if dev.deviceTypeId == "solarsmartLoad":
-            self._hydrate_load_state_from_device(device)
+            self._hydrate_load_state_from_device(dev)
 
         if dev.deviceTypeId != "solarsmartMain":
             return
