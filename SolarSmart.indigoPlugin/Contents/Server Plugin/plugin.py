@@ -236,6 +236,29 @@ class SolarSmartAsyncManager:
         if getattr(self.plugin, "debug2", False):
             self.plugin.logger.debug("_ticker_main_states: exiting (stopThread set)")
 
+    def _shed_all(self, reason: str, tiers: set[int] | None = None):
+        """
+        Turn OFF all running SmartSolar Load devices.
+        If `tiers` is provided, only shed those tiers.
+        """
+        dbg = getattr(self.plugin, "debug2", False)
+        if dbg:
+            self.plugin.logger.debug(f"_shed_all: reason='{reason}' tiers={tiers if tiers else 'ALL'}")
+
+        for dev in indigo.devices.iter("self"):
+            if dev.deviceTypeId != "solarsmartLoad" or not dev.enabled:
+                continue
+            if tiers:
+                try:
+                    t = int(dev.pluginProps.get("tier", 0) or 0)
+                    if t not in tiers:
+                        continue
+                except Exception:
+                    pass
+            if self._is_running(dev):
+                self._ensure_off(dev, reason)
+
+
     async def _ticker_load_scheduler(self, period_sec: float):
         """
         Every ~period_sec: decide which solarsmartLoad devices should be ON/OFF
@@ -248,6 +271,13 @@ class SolarSmartAsyncManager:
         # keyed by load dev id: {"running": bool, "start_ts": float, "served_quota_mins": int, ...}
         if not hasattr(self.plugin, "_load_state"):
             self.plugin._load_state = {}
+        # early in _ticker_load_scheduler
+        main = next((d for d in indigo.devices if d.deviceTypeId == "solarsmartMain" and d.enabled), None)
+        if not main:
+            if getattr(self.plugin, "debug2", False):
+                self.plugin.logger.debug("_ticker_load_scheduler: no Main device found; shedding any running loads")
+            self._shed_all("No Main device available")
+            return
 
         while not getattr(self.plugin, "stopThread", False):
             try:
@@ -1025,20 +1055,28 @@ class SolarSmartAsyncManager:
         # start accruing runtime per tick in a separate tally
         # (here we’ll add minutes on each scheduler pass if still running)
 
-    def _ensure_off(self, dev: indigo.Device, reason: str):
-        if not self._is_running(dev):
-            return
-        self._execute_load_action(dev, turn_on=False, reason=reason)
-        st = self.plugin._load_state.get(dev.id, {})
-        ts = st.get("start_ts")
-        if ts:
-            mins = max(1, int(round((time.time() - ts) / 60.0)))
-            self._add_served_minutes(dev, mins)  # this also updates RuntimeQuotaMins
-            # Recompute Remaining
-            props = dev.pluginProps or {}
-            self._quota_remaining_mins(dev, props, datetime.now())
-        self._mark_running(dev, False)
-        dev.updateStateOnServer("LastReason", reason)
+    def _ensure_off(self, dev, reason: str):
+        """Turn a running load OFF and bookkeeping."""
+        try:
+            if not self._is_running(dev):
+                # still write reason for visibility
+                dev.updateStateOnServer("LastReason", reason)
+                return
+
+            # Call your existing ON/OFF executor (you added this earlier)
+            self._execute_load_action(dev, turn_on=False, reason=reason)
+
+            # Update internal state & device states
+            st = self.plugin._load_state.setdefault(dev.id, {})
+            st["start_ts"] = None
+            dev.updateStateOnServer("IsRunning", False)
+            dev.updateStateOnServer("Status", "OFF")
+            dev.updateStateOnServer("LastReason", reason)
+
+            if getattr(self.plugin, "debug2", False):
+                self.plugin.logger.debug(f"_ensure_off: {dev.name} → OFF ({reason})")
+        except Exception:
+            self.plugin.logger.exception(f"_ensure_off: error while stopping {dev.name}")
 
 
 class Plugin(indigo.PluginBase):
