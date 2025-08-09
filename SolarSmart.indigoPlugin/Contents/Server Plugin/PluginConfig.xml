@@ -1,0 +1,98 @@
+<?xml version="1.0"?>
+<PluginConfig>
+    <Field id="infoLabel0" type="label" fontSize='large' fontColor="black">
+        <Field id="sep7c" type="separator"/>
+
+        <Label>SmartSolar Indigo Plugin</Label>
+    </Field>
+    <Field id="space0" type="label" fontColor="black">
+        <Label>Developed by: GlennNZ</Label>
+    </Field>
+        <Field id="sepa37" type="separator"/>
+   <Field id="infoLabel01" type="label" fontSize='large' fontColor="blue">
+        <Label>This is the Smart Solar Main Solar Generation Information Device.
+        </Label>
+    </Field>
+
+    <Field id="space10" type="label" alignText="right">
+        <Label>Debugging Options:</Label>
+    </Field>
+    <Field id="sep4" type="separator"/>
+    <Field id="space11" type="label" fontSize="small">
+        <Label>Turn on debugging only when needed. Be careful when posting the output to the forums or other public places as it could expose sensitive information.</Label>
+    </Field>
+    <Field id="debug1" type="checkbox" tooltip="Enabling will result in verbose logging of IP150 connection.">
+        <Label/>
+        <Description>1. Debug 1</Description>
+    </Field>
+
+    <Field id="debug2" type="checkbox" hidden="False" tooltip="Enabling will result in .">
+        <Label/>
+        <Description>2. Debug 2</Description>
+    </Field>
+
+    <Field id="debug3" type="checkbox" hidden="False"  tooltip="Enabling will result .">
+        <Label/>
+        <Description>3. Debug Menu Action Device Selections (verbose)</Description>
+    </Field>
+
+    <Field id="debug4" type="checkbox" hidden="True" tooltip="Enabling will result .">
+        <Label/>
+        <Description>4. Debug4</Description>
+    </Field>
+
+    <Field id="debug5" type="checkbox" hidden="True"  tooltip="Enabling will .">
+        <Label/>
+        <Description>5. Debug 5</Description>
+    </Field>
+
+    <Field id="debug6" type="checkbox" hidden="True" tooltip="Enabling will .">
+        <Label/>
+        <Description>6. Debug 6</Description>
+    </Field>
+
+    <Field id="debug7" type="checkbox" hidden="True"  tooltip="Enabling will .">
+        <Label/>
+        <Description>7. Debug 7</Description>
+    </Field>
+
+    <Field id="debug8" type="checkbox" hidden="True"  tooltip="Enabling will .">
+        <Label/>
+        <Description>8. Debug 8</Description>
+    </Field>
+    <Field id="debug9" type="checkbox" hidden="True" tooltip="Enabling will .">
+        <Label/>
+        <Description>9. Debug 9</Description>
+    </Field>
+    <Field id="sep7a2e" type="separator"/>
+    <Field id="showDebugLevel" type="menu" defaultValue="20" tooltip="Controls the amount of debug information written to the log.">
+        <Label>Indigo Log Debug level:</Label>
+        <Description>Level of Debug information to show in Indigo</Description>
+        <List>
+            <Option value="5">Detailed Debugging Messages</Option>
+            <Option value="10">Debugging Messages</Option>
+            <Option value="20">Informational Messages</Option>
+            <Option value="30">Warning Messages</Option>
+            <Option value="40">Error Messages</Option>
+            <Option value="50">Critical Errors Only</Option>
+        </List>
+    </Field>
+        <Field id="showDebugFileLevel" type="menu" defaultValue="5" tooltip="Controls the amount of debug information written to the log.">
+        <Label>File Debug level:</Label>
+        <Description>Level of Debug information saved to File</Description>
+        <List>
+            <Option value="5">Detailed Debugging Messages</Option>
+            <Option value="10">Debugging Messages</Option>
+            <Option value="20">Informational Messages</Option>
+            <Option value="30">Warning Messages</Option>
+            <Option value="40">Error Messages</Option>
+            <Option value="50">Critical Errors Only</Option>
+        </List>
+    </Field>
+     <Field id="previousVersion"
+           type="textfield"
+           defaultValue="0.0.1" hidden="true">
+        <Label></Label>
+    </Field>
+
+</PluginConfig>

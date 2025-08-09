@@ -1,0 +1,1950 @@
+#! /usr/bin/env python2.6
+# -*- coding: utf-8 -*-
+
+"""
+"""
+import logging
+import datetime
+import time as t
+import time
+import sys
+import os
+import shutil
+import subprocess
+import sys
+import os
+from os import path
+import shutil
+import traceback
+import asyncio
+import threading
+import platform
+try:
+    import indigo
+except:
+    pass
+import asyncio
+import random
+from datetime import datetime
+from PIL import Image, ImageDraw, ImageFont
+import re
+
+import re
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+Number = Union[int, float]
+
+# ────────────────────────────────────────────────────────────
+# Small validators
+# ────────────────────────────────────────────────────────────
+
+def _is_valid_choice(v):
+    try:
+        return int(v) > 0
+    except Exception:
+        return False
+
+def _valid_pos_int(v):
+    try:
+        return int(str(v).strip()) > 0
+    except Exception:
+        return False
+
+def _valid_hhmm(s: str) -> bool:
+    if not s or ":" not in s:
+        return False
+    hh, mm = s.split(":", 1)
+    try:
+        h = int(hh); m = int(mm)
+        return 0 <= h <= 23 and 0 <= m <= 59
+    except Exception:
+        return False
+
+def _time_window_allowed(props, now_dt: datetime) -> bool:
+    start = props.get("windowStart", "00:00")
+    end   = props.get("windowEnd", "23:59")
+    try:
+        sh, sm = [int(x) for x in start.split(":", 1)]
+        eh, em = [int(x) for x in end.split(":", 1)]
+    except Exception:
+        return True  # be permissive if misconfigured
+    cur = now_dt.hour*60 + now_dt.minute
+    s = sh*60 + sm
+    e = eh*60 + em
+    if s <= e:
+        return s <= cur <= e
+    else:
+        # window crosses midnight
+        return cur >= s or cur <= e
+
+def _dow_allowed(props, now_dt: datetime) -> bool:
+    dow_map = ["dowMon", "dowTue", "dowWed", "dowThu", "dowFri", "dowSat", "dowSun"]
+    allowed = [props.get(k, False) in (True, "true", "True") for k in dow_map]
+    # datetime.weekday(): Monday=0..Sunday=6
+    return allowed[now_dt.weekday()]
+
+# ---- small utils ----
+def _int(v, default=0):
+    try:
+        return int(float(str(v).replace(",", "").strip()))
+    except Exception:
+        return default
+################################################################################
+class IndigoLogHandler(logging.Handler):
+    def __init__(self, display_name, level=logging.NOTSET):
+        super().__init__(level)
+        self.displayName = display_name
+
+    def emit(self, record):
+        """ not used by this class; must be called independently by indigo """
+        logmessage = ""
+        try:
+            levelno = int(record.levelno)
+            is_error = False
+            is_exception = False
+            if self.level <= levelno:  ## should display this..
+                if record.exc_info !=None:
+                    is_exception = True
+                if levelno == 5:	# 5
+                    logmessage = '({}:{}:{}): {}'.format(path.basename(record.pathname), record.funcName, record.lineno, record.getMessage())
+                elif levelno == logging.DEBUG:	# 10
+                    logmessage = '({}:{}:{}): {}'.format(path.basename(record.pathname), record.funcName, record.lineno, record.getMessage())
+                elif levelno == logging.INFO:		# 20
+                    logmessage = record.getMessage()
+                elif levelno == logging.WARNING:	# 30
+                    logmessage = record.getMessage()
+                elif levelno == logging.ERROR:		# 40
+                    logmessage = '({}: Function: {}  line: {}):    Error :  Message : {}'.format(path.basename(record.pathname), record.funcName, record.lineno, record.getMessage())
+                    is_error = True
+                if is_exception:
+                    logmessage = '({}: Function: {}  line: {}):    Exception :  Message : {}'.format(path.basename(record.pathname), record.funcName, record.lineno, record.getMessage())
+                    indigo.server.log(message=logmessage, type=self.displayName, isError=is_error, level=levelno)
+                    if record.exc_info !=None:
+                        etype,value,tb = record.exc_info
+                        tb_string = "".join(traceback.format_tb(tb))
+                        indigo.server.log(f"Traceback:\n{tb_string}", type=self.displayName, isError=is_error, level=levelno)
+                        indigo.server.log(f"Error in plugin execution:\n\n{traceback.format_exc(30)}", type=self.displayName, isError=is_error, level=levelno)
+                    indigo.server.log(f"\nExc_info: {record.exc_info} \nExc_Text: {record.exc_text} \nStack_info: {record.stack_info}",type=self.displayName, isError=is_error, level=levelno)
+                    return
+                indigo.server.log(message=logmessage, type=self.displayName, isError=is_error, level=levelno)
+        except Exception as ex:
+            indigo.server.log(f"Error in Logging: {ex}",type=self.displayName, isError=is_error, level=levelno)
+################################################################################
+# Async Smart Solar Class
+################################################################################
+class SolarSmartAsyncManager:
+    """
+    Owns the long-running async loops for SolarSmart.
+    Keeps a reference to the plugin and its asyncio loop.
+    """
+    def __init__(self, plugin, event_loop: asyncio.AbstractEventLoop):
+        self.plugin = plugin
+        self.loop = event_loop
+        self._tasks = []
+
+    # ----- lifecycle -----
+
+    async def start(self):
+        """Schedule forever loops. Call once from _async_start()."""
+        if getattr(self.plugin, "debug2", False):
+            self.plugin.logger.debug("SolarSmartAsyncManager.start()")
+
+        # Main 30s ticker (pv/consumption/battery -> publish states)
+        self._tasks.append(self.loop.create_task(self._ticker_main_states(period_sec=30.0)))
+
+        # (Future) add other forever tasks here (e.g., load scheduler)
+        self._tasks.append(self.loop.create_task(self._ticker_load_scheduler(period_sec=60.0)))
+
+    async def stop(self):
+        """Cancel all tasks gracefully."""
+        if getattr(self.plugin, "debug2", False):
+            self.plugin.logger.debug("SolarSmartAsyncManager.stop(): cancelling tasks")
+
+        for t in self._tasks:
+            t.cancel()
+        # Give tasks a chance to finish
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
+
+    # ----- forever loops -----
+    def _get_main_device(self):
+        return next(
+            (d for d in indigo.devices if d.deviceTypeId == "solarsmartMain" and d.enabled),
+            None
+        )
+
+    def _get_max_concurrent_loads(self) -> int:
+        main = self._get_main_device()
+        # default if no main or not configured
+        val = 2
+        if main:
+            try:
+                raw = main.pluginProps.get("maxConcurrentLoads", "2")
+                val = int(str(raw).strip() or "2")
+            except Exception:
+                val = 2
+        # clamp to sane range
+        val = max(1, min(val, 32))
+        if getattr(self.plugin, "debug2", False):
+            self.plugin.logger.debug(f"maxConcurrentLoads (from Main #{main.id if main else 'n/a'}) = {val}")
+        return val
+
+
+    async def _ticker_main_states(self, period_sec: float):
+        """
+        Every ~period_sec: update all SolarSmart Main devices' custom states.
+        """
+        # Add tiny jitter so multiple plugins don't sync-beat the server
+        jitter = random.uniform(0.0, 0.7)
+        await asyncio.sleep(jitter)
+
+        if getattr(self.plugin, "debug2", False):
+            self.plugin.logger.debug(f"_ticker_main_states: starting (period={period_sec}s, jitter={jitter:.2f}s)")
+
+        while not getattr(self.plugin, "stopThread", False):
+            try:
+                # Iterate all enabled SolarSmart Main devices
+                count = 0
+                for dev in indigo.devices.iter("self"):  # all devices owned by this plugin
+                    if dev.deviceTypeId != "solarsmartMain":
+                        continue
+                    if not dev.enabled:
+                        if getattr(self.plugin, "debug2", False):
+                            self.plugin.logger.debug(f"_ticker_main_states: skip {dev.name} (disabled)")
+                        continue
+
+                    # Update PV/Consumption/Battery/Headroom/LastUpdate
+                    if getattr(self.plugin, "debug2", False):
+                        self.plugin.logger.debug(f"_ticker_main_states: updating {dev.name} (#{dev.id})")
+                    self.plugin._update_solarsmart_states(dev)  # uses helpers we wrote earlier
+                    count += 1
+
+                if getattr(self.plugin, "debug2", False):
+                    self.plugin.logger.debug(f"_ticker_main_states: updated {count} main device(s) at {datetime.now()}")
+
+            except asyncio.CancelledError:
+                # Task cancelled -> exit loop cleanly
+                break
+            except Exception as e:
+                self.plugin.logger.exception(f"_ticker_main_states: exception: {e}")
+
+            # Sleep the base period; wake earlier if plugin is stopping
+            for _ in range(int(period_sec)):
+                if getattr(self.plugin, "stopThread", False):
+                    break
+                await asyncio.sleep(1.0)
+
+        if getattr(self.plugin, "debug2", False):
+            self.plugin.logger.debug("_ticker_main_states: exiting (stopThread set)")
+
+    async def _ticker_load_scheduler(self, period_sec: float):
+        """
+        Every ~period_sec: decide which solarsmartLoad devices should be ON/OFF
+        given current headroom, priorities, windows, quotas, and hysteresis.
+        """
+        if getattr(self.plugin, "debug2", False):
+            self.plugin.logger.debug(f"_ticker_load_scheduler: starting (period={period_sec}s)")
+
+        # In-memory runtime state (persist later if you like)
+        # keyed by load dev id: {"running": bool, "start_ts": float, "served_quota_mins": int, ...}
+        if not hasattr(self.plugin, "_load_state"):
+            self.plugin._load_state = {}
+
+        while not getattr(self.plugin, "stopThread", False):
+            try:
+                # 1) Get best-available headroom from any enabled SolarSmart Main device
+                headroom_w = self._get_current_headroom_w()
+                if headroom_w is None:
+                    # No main yet—shed all loads just in case
+                    self._shed_all("No headroom available (no main readings)")
+                    await asyncio.sleep(period_sec)
+                    continue
+
+                # 2) Collect eligible loads grouped by tier
+                loads_by_tier = self._collect_eligible_loads()
+
+                # 3) Decide ON/OFF per tier (waterfall)
+                self._schedule_by_tier(loads_by_tier, headroom_w)
+
+                self._accrue_runtime_for_running_loads(period_sec)
+
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.plugin.logger.exception(f"_ticker_load_scheduler: exception: {e}")
+
+            # Sleep the cadence
+            for _ in range(int(period_sec)):
+                if getattr(self.plugin, "stopThread", False):
+                    break
+                await asyncio.sleep(1.0)
+
+        if getattr(self.plugin, "debug2", False):
+            self.plugin.logger.debug("_ticker_load_scheduler: exiting (stopThread set)")
+
+    def _accrue_runtime_for_running_loads(self, period_sec: float):
+        """
+        Called once per scheduler tick. Accrues:
+          - RuntimeQuotaMins (RunMin) for quota
+          - RuntimeWindowMins for UI
+          - Keeps RemainingQuotaMins in sync
+        """
+        add_m = self._quota_tick_minutes(period_sec)
+        now_ts = time.time()
+        for dev in indigo.devices.iter("self"):
+            if dev.deviceTypeId != "solarsmartLoad" or not dev.enabled:
+                continue
+            props = dev.pluginProps or {}
+            self._ensure_quota_anchor(dev, props, now_ts)
+            if not self._is_running(dev):
+                continue
+            # Quota minutes
+            self._add_served_minutes(dev, add_m)
+            # Window runtime minutes (for display)
+            try:
+                cur_window = int(dev.states.get("RuntimeWindowMins", 0) or 0)
+                dev.updateStateOnServer("RuntimeWindowMins", cur_window + add_m)
+            except Exception:
+                pass
+            # Refresh RemainingQuotaMins
+            self._quota_remaining_mins(dev, props, datetime.now())
+
+## Render Table Code Base
+
+    def _render_table_png(self, table_text: str, filename: str = "scheduler.png",
+                          font_size: int = 20, padding_px=(12, 10, 12, 12)) -> str:
+        """
+        Render a transparent PNG for the scheduler table with:
+          • Emoji title/footer (native color)
+          • Monospaced grid (perfect alignment)
+          • Alternating row shading
+          • Status/Action colored
+          • Name column green when RUN
+          • Tier medals (emoji) overlaid near the Tier cell
+        Saves to self.plugin.saveDirectory/filename and returns the full path.
+        """
+        dbg = getattr(self.plugin, "debug2", False)
+        log = self.plugin.logger
+
+        if dbg:
+            log.debug(f"_render_table_png: start len={len(table_text or '')}, file={filename}, font_size={font_size}")
+
+        # ---------- Parse lines ----------
+        lines = (table_text or "").splitlines()
+        if not lines:
+            lines = ["(no data)"]
+
+        has_banner = (len(lines) >= 3 and "│" in (lines[1] if len(lines) > 1 else ""))
+        header = lines[1] if has_banner else lines[0]
+        sep_line = lines[2] if has_banner else (lines[1] if len(lines) > 1 else "")
+        row_start = 3 if has_banner else 2
+        row_end = -2 if has_banner and len(lines) >= 4 else len(lines)
+        rows = lines[row_start:row_end] if len(lines) > 3 else []
+
+        # Footer headroom
+        src_footer = lines[-1] if len(lines) > 0 else ""
+        m = re.search(r"(-?\d+)\s*W", src_footer)
+        headroom_val = m.group(1) if m else "?"
+        if dbg:
+            log.debug(f"_render_table_png: rows={len(rows)}, parsed headroom={headroom_val}")
+
+        # ---------- Fonts ----------
+        # Monospace for grid
+        mono = None
+        for fp in ("/System/Library/Fonts/Menlo.ttc",
+                   "/System/Library/Fonts/SFNSMono.ttf",
+                   "/Library/Fonts/Menlo.ttc"):
+            try:
+                mono = ImageFont.truetype(fp, font_size)
+                if dbg: log.debug(f"_render_table_png: mono font={fp}")
+                break
+            except Exception:
+                pass
+        if mono is None:
+            mono = ImageFont.load_default()
+            if dbg: log.debug("_render_table_png: mono font=default")
+
+        # Emoji font (20px exact; draw WITHOUT fill to keep native color)
+        try:
+            emoji_font = ImageFont.truetype("/System/Library/Fonts/Apple Color Emoji.ttc", font_size)
+            if dbg: log.debug("_render_table_png: emoji font=Apple Color Emoji @20")
+        except Exception as e:
+            emoji_font = mono
+            if dbg: log.debug(f"_render_table_png: emoji font fallback to mono: {e}")
+
+        # Helper: draw text; omit fill for emoji font to preserve native color
+        def draw_text(drw: ImageDraw.ImageDraw, xy, text, font, color):
+            if font is emoji_font:
+                drw.text(xy, text, font=font)  # no fill -> native emoji color
+            else:
+                drw.text(xy, text, font=font, fill=color)
+
+        # ---------- Measure helpers ----------
+        dummy = Image.new("RGBA", (10, 10), (0, 0, 0, 0))
+        d0 = ImageDraw.Draw(dummy)
+
+        def text_wh(s: str, font) -> tuple:
+            bbox = d0.textbbox((0, 0), s, font=font)
+            return (bbox[2] - bbox[0], bbox[3] - bbox[1])
+
+        line_gap = max(2, int(font_size * 0.25))
+
+        # Title (emoji + text segments)
+        title_segments = [("🌞", emoji_font), ("⚡", emoji_font),
+                          (" SolarSmart Load Scheduler ", mono),
+                          ("⚡", emoji_font), ("🌞", emoji_font)]
+        # Footer (emoji + text)
+        footer_segments = [("📊", emoji_font), (f" Final Headroom: {headroom_val} W", mono)]
+
+        # ---------- Column parsing ----------
+        parts = [p.strip() for p in header.split("│")]
+        idx_tier = next((i for i, p in enumerate(parts) if p.lower().startswith("tier")), None)
+        idx_name = next((i for i, p in enumerate(parts) if "name" in p.lower()), None)
+        idx_status = next((i for i, p in enumerate(parts) if p.lower().startswith("status")), None)
+        idx_action = next((i for i, p in enumerate(parts) if p.lower().startswith("action")), None)
+
+        cuts = [m.end() for m in re.finditer(r"│\s*", header)]
+        cell_starts = [0] + cuts
+        x_positions = []
+        for start in cell_starts:
+            prefix = header[:start]
+            x_positions.append(d0.textbbox((0, 0), prefix, font=mono)[2])
+        if len(x_positions) > len(parts):
+            x_positions = x_positions[:len(parts)]
+        while len(x_positions) < len(parts):
+            x_positions.append(x_positions[-1] if x_positions else 0)
+
+        if dbg:
+            log.debug(f"_render_table_png: header parts={parts}")
+            log.debug(
+                f"_render_table_png: idx_tier={idx_tier}, idx_name={idx_name}, idx_status={idx_status}, idx_action={idx_action}")
+            log.debug(f"_render_table_png: x_positions={x_positions}")
+
+        # ---------- Colors ----------
+        col_text = (230, 233, 238, 255)  # body text
+        col_dim = (170, 175, 185, 255)  # header/separator text
+        col_status_run = (40, 205, 65, 255)  # green
+        col_status_off = (155, 160, 170, 255)  # gray
+        col_action_start = (255, 179, 0, 255)  # amber
+        col_action_keep = (90, 200, 250, 255)  # blue-ish
+        col_action_stop = (255, 69, 58, 255)  # red
+        col_action_skip = (200, 200, 205, 255)  # light gray
+        row_fill_a = (255, 255, 255, 18)  # subtle alt fill
+        row_fill_b = (255, 255, 255, 0)  # transparent
+
+        status_marks = {"RUN": "✓", "OFF": "✗"}
+        action_marks = {"START": "⚡", "KEEP": "▶", "STOP": "■", "SKIP": "·"}
+
+        def tier_medal(t: int) -> str:
+            return "🥇" if t == 1 else "🥈" if t == 2 else "🥉" if t == 3 else "🎯"
+
+        # ---------- Measure canvas ----------
+        title_w = sum(text_wh(seg, f)[0] for seg, f in title_segments)
+        title_h = max(text_wh(seg, f)[1] for seg, f in title_segments)
+        header_w, header_h = text_wh(header, mono)
+        sep_w, sep_h = text_wh(sep_line, mono)
+        row_ws = [text_wh(r, mono)[0] for r in rows] if rows else [0]
+        row_hs = [text_wh(r, mono)[1] for r in rows] if rows else [0]
+        max_row_w = max(row_ws) if row_ws else 0
+        row_h = max(row_hs) if row_hs else header_h
+        footer_w = sum(text_wh(seg, f)[0] for seg, f in footer_segments)
+        footer_h = max(text_wh(seg, f)[1] for seg, f in footer_segments)
+
+        block_w = max(title_w, header_w, sep_w, max_row_w, footer_w)
+        block_h = title_h + line_gap + header_h + line_gap + sep_h + line_gap
+        block_h += (len(rows) * (row_h + line_gap))
+        block_h += sep_h + line_gap + footer_h
+
+        pad_l, pad_t, pad_r, pad_b = padding_px
+        img_w = block_w + pad_l + pad_r
+        img_h = block_h + pad_t + pad_b
+
+        if dbg:
+            log.debug(f"_render_table_png: canvas {img_w}x{img_h}, rows={len(rows)}")
+
+        # ---------- Canvas ----------
+        img = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
+        drw = ImageDraw.Draw(img)
+
+        # ---------- Draw Title (emoji+text segments) ----------
+        y = pad_t
+        x = pad_l
+        for seg, f in title_segments:
+            draw_text(drw, (x, y), seg, f, col_text)  # emojis drawn with native color
+            x += text_wh(seg, f)[0]
+        y += title_h + line_gap
+
+        # ---------- Header + separator ----------
+        draw_text(drw, (pad_l, y), header, mono, col_dim)
+        y += header_h + line_gap
+        draw_text(drw, (pad_l, y), sep_line, mono, col_dim)
+        y += sep_h + line_gap
+
+        # ---------- Body rows ----------
+        for i, line in enumerate(rows):
+            # stripe
+            drw.rectangle([pad_l, y - 2, pad_l + block_w, y + row_h + 1],
+                          fill=row_fill_a if (i % 2 == 0) else row_fill_b)
+
+            cells = [c for c in line.split("│")]
+            while len(cells) < len(parts):
+                cells.append("")
+
+            # Is running?
+            is_running = False
+            if idx_status is not None and idx_status < len(cells):
+                s_val = cells[idx_status].strip().upper()
+                if "RUN" in s_val or s_val.startswith("✓"):
+                    is_running = True
+
+            for idx in range(len(parts)):
+                raw = cells[idx].strip()
+                text_out = raw
+                color = col_text
+
+                # Status normalize + color
+                if idx_status is not None and idx == idx_status:
+                    if is_running:
+                        color = col_status_run
+                        text_out = f"{status_marks['RUN']} RUN"
+                    else:
+                        color = col_status_off
+                        text_out = f"{status_marks['OFF']} OFF"
+
+                # Action color
+                elif idx_action is not None and idx == idx_action:
+                    up = raw.upper()
+                    if "START" in up or "⚡" in up:
+                        color = col_action_start;
+                        text_out = f"{action_marks['START']} START"
+                    elif "KEEP" in up or "▶" in up:
+                        color = col_action_keep;
+                        text_out = f"{action_marks['KEEP']} KEEP"
+                    elif "STOP" in up or "■" in up:
+                        color = col_action_stop;
+                        text_out = f"{action_marks['STOP']} STOP"
+                    elif "SKIP" in up or "·" in up:
+                        color = col_action_skip;
+                        text_out = f"{action_marks['SKIP']} SKIP"
+
+                # Name green when running
+                elif idx_name is not None and idx == idx_name and is_running:
+                    color = col_status_run
+
+                x_cell = pad_l + (x_positions[idx] if idx < len(x_positions) else 0)
+                draw_text(drw, (x_cell, y), text_out, mono, color)
+
+                # Tier medal overlay (emoji next to the Tier value)
+                if idx_tier is not None and idx == idx_tier and emoji_font is not mono:
+                    try:
+                        t = int(raw.split()[0])
+                        medal = tier_medal(t)
+                        # Draw medal at the cell start; no fill (native color)
+                        draw_text(drw, (x_cell, y), medal, emoji_font, col_text)
+                    except Exception:
+                        pass
+
+            y += row_h + line_gap
+
+        # ---------- Bottom separator + Footer ----------
+        draw_text(drw, (pad_l, y), sep_line if sep_line else ("─" * max(10, len(header))), mono, col_dim)
+        y += sep_h + line_gap
+
+        x = pad_l
+        for seg, f in footer_segments:
+            draw_text(drw, (x, y), seg, f, col_text)  # emoji drawn color; text in mono
+            x += text_wh(seg, f)[0]
+        y += footer_h + line_gap
+
+        # ---------- Save ----------
+        out_path = os.path.join(self.plugin.saveDirectory, filename)
+        img.save(out_path, format="PNG")
+
+        if dbg:
+            log.debug(f"_render_table_png: saved {out_path} ({img_w}x{img_h}), rows={len(rows)})")
+
+        return out_path
+
+    # ========== Headroom ==========
+# ========== Headroom ==========
+    def _get_current_headroom_w(self) -> int | None:
+        """
+        Pick the first enabled SolarSmart Main device and read Headroom if present.
+        If Headroom missing, compute PV - Consumption (best effort).
+        """
+        for dev in indigo.devices.iter("self"):
+            if dev.deviceTypeId != "solarsmartMain":
+                continue
+            if not dev.enabled:
+                continue
+
+            # Prefer existing Headroom state if available
+            headroom = dev.states.get("Headroom", None)
+            if headroom is not None:
+                try:
+                    return int(headroom)
+                except Exception:
+                    pass
+
+            # Fallback compute
+            pv = dev.states.get("SolarProduction", None)
+            cons = dev.states.get("SiteConsumption", None)
+            if pv is not None and cons is not None:
+                try:
+                    return int(pv) - int(cons)
+                except Exception:
+                    continue
+
+        return None
+
+    # ========== Gather loads ==========
+    def _collect_eligible_loads(self) -> dict[int, list[indigo.Device]]:
+        """
+        Return dict tier -> [load devices], **eligible** by window/DOW/quota.
+        Within a tier, we’ll later sort by least served quota to be fair.
+        """
+        tiers: dict[int, list[indigo.Device]] = {}
+        now = datetime.now()
+
+        for dev in indigo.devices.iter("self"):
+            if dev.deviceTypeId != "solarsmartLoad" or not dev.enabled:
+                continue
+
+            props = dev.pluginProps or {}
+
+            # DOW allowed?
+            if not _dow_allowed(props, now):
+                self._ensure_off(dev, "Window closed (DOW)")
+                continue
+
+            # Time window allowed?
+            if not _time_window_allowed(props, now):
+                self._ensure_off(dev, "Window closed (time)")
+                continue
+
+            # Quota remaining?
+            remaining = self._quota_remaining_mins(dev, props, now)
+            if remaining <= 0:
+                self._ensure_off(dev, "Quota exhausted")
+                continue
+
+            # Good: put into its tier
+            tier = int(props.get("tier", 2))
+            tiers.setdefault(tier, []).append(dev)
+
+        # Fairness: sort each tier by least served quota minutes
+        for t in tiers:
+            tiers[t].sort(key=lambda d: self._served_quota_mins(d))
+        return dict(sorted(tiers.items(), key=lambda kv: kv[0]))  # lowest tier number first
+
+    # ========== ON/OFF decisions per tier ==========
+    def _schedule_by_tier(self, loads_by_tier: dict[int, list[indigo.Device]], headroom_w: int):
+        dbg = getattr(self.plugin, "debug2", False)
+        max_concurrent = self._get_max_concurrent_loads()
+        starts_this_tick = 0
+
+        table_rows = []  # for final summary table
+
+        if dbg:
+            self.plugin.logger.debug("===== LOAD SCHEDULER TICK =====")
+            self.plugin.logger.debug(f"Initial headroom: {headroom_w} W")
+
+        # Build list of currently running
+        running_pairs = []
+        for tier, devs in loads_by_tier.items():
+            for d in devs:
+                if self._is_running(d):
+                    running_pairs.append((tier, d))
+        running_pairs.sort(key=lambda x: x[0], reverse=True)
+
+        # Shed if already negative
+        if headroom_w < 0 and running_pairs:
+            headroom_w = self._shed_until_positive(headroom_w, running_pairs)
+
+        running_now = sum(1 for _, d in running_pairs if self._is_running(d))
+
+        # Process tiers
+        for tier, devs in sorted(loads_by_tier.items()):
+            for d in devs:
+                props = d.pluginProps or {}
+                rated = _int(props.get("ratedWatts"), 0)
+                remaining = self._quota_remaining_mins(d, props, datetime.now())
+                surge_mult = float(props.get("surgeMultiplier", "1.2") or 1.2)
+                start_margin = float(props.get("startMarginPct", "20") or 20.0) / 100.0
+                needed_w = int(rated * surge_mult * (1.0 + start_margin))
+
+                status = "RUN" if self._is_running(d) else "OFF"
+                action = ""
+                before_headroom = headroom_w
+
+                if self._is_running(d):
+                    headroom_w = self._evaluate_keep(d, headroom_w)
+                    action = "KEEP"
+                else:
+                    if starts_this_tick >= 1:
+                        action = "SKIP (cap)"
+                    elif running_now >= max_concurrent:
+                        action = "SKIP (conc)"
+                    elif remaining <= 0:
+                        action = "SKIP (quota)"
+                    elif not self._cooldown_met(d, _int(props.get("cooldownMins"), 0)):
+                        action = "SKIP (cooldn)"
+                    elif headroom_w >= needed_w:
+                        self._ensure_on(d, "Start ok (threshold met)")
+                        headroom_w -= rated
+                        starts_this_tick += 1
+                        running_now += 1
+                        action = "START"
+                    else:
+                        action = "SKIP (headrm)"
+
+                table_rows.append((
+                    tier,
+                    d.name,
+                    rated,
+                    status,
+                    remaining,
+                    before_headroom,
+                    needed_w,
+                    action
+                ))
+
+        # Final safety shed
+        if headroom_w < 0 and running_pairs:
+            headroom_w = self._shed_until_positive(headroom_w, running_pairs)
+
+        # Print summary table
+        # At end of _schedule_by_tier()
+
+        # Build a dynamically sized table (header + rows) so columns align with long names
+        try:
+            # Map plain status/action to single-width symbols (dingbats) for alignment
+            status_marks = {
+                "RUN": "✓",  # running
+                "OFF": "✗",  # off
+                "PAUS": "⏸",  # paused (if you ever set it)
+            }
+            action_marks = {
+                "START": "⚡",
+                "KEEP": "▶",
+                "STOP": "■",
+                "SKIP": "·",  # bullet for skipped
+            }
+
+            # 1) Dynamic widths
+            name_header = "Load Name"
+            name_width = max(len(name_header), max((len(name) for _, name, *_ in table_rows), default=0))
+            w_tier, w_rated, w_status, w_rem, w_hdrm, w_need, w_action = 4, 6, 6, 6, 8, 7, 7
+
+            # 2) Row formatter (box-drawing grid)
+            def row_line(tier, name, rated, status, rem, hdrm, need, action):
+                # Normalize status/action text to 4-letter keys used above
+                status_key = "RUN" if status.upper().startswith("RUN") else "OFF"
+                action_key = (
+                    "START" if action.upper().startswith("START") else
+                    "KEEP" if action.upper().startswith("KEEP") else
+                    "STOP" if action.upper().startswith("STOP") else
+                    "SKIP"
+                )
+                s_icon = status_marks.get(status_key, " ")
+                a_icon = action_marks.get(action_key, " ")
+
+                return (
+                    f"{tier:<{w_tier}} │ "
+                    f"{name:<{name_width}} │ "
+                    f"{rated:<{w_rated}} │ "
+                    f"{s_icon} {status:<{w_status - 2}} │ "
+                    f"{rem:>{w_rem}} │ "
+                    f"{hdrm:>{w_hdrm}} │ "
+                    f"{need:>{w_need}} │ "
+                    f"{a_icon} {action:<{w_action - 2}}"
+                )
+
+            # 3) Header & separators (use emoji only in the banner)
+            header = (
+                f"{'Tier':<{w_tier}} │ "
+                f"{name_header:<{name_width}} │ "
+                f"{'RatedW':<{w_rated}} │ "
+                f"{'Status':<{w_status}} │ "
+                f"{'RemMin':>{w_rem}} │ "
+                f"{'Headroom':>{w_hdrm}} │ "
+                f"{'NeededW':>{w_need}} │ "
+                f"{'Action':<{w_action}}"
+            )
+            sep_mid = (
+                f"{'─' * w_tier}─┼─"
+                f"{'─' * name_width}─┼─"
+                f"{'─' * w_rated}─┼─"
+                f"{'─' * w_status}─┼─"
+                f"{'─' * w_rem}─┼─"
+                f"{'─' * w_hdrm}─┼─"
+                f"{'─' * w_need}─┼─"
+                f"{'─' * w_action}"
+            )
+            # Cute emoji banner lines (don’t need to align with columns)
+            banner_top = "🌞📈  SolarSmart Scheduler  📊🔌"
+            banner_bottom = f"🌤️  Final headroom: {headroom_w} W"
+
+            # 4) Build rows
+            rows_str = "\n".join(
+                row_line(tier, name, rated, status, rem, hdrm, need, action)
+                for tier, name, rated, status, rem, hdrm, need, action in table_rows
+            )
+
+            # 5) Debug log
+            if dbg:
+                self.plugin.logger.debug(banner_top)
+                self.plugin.logger.debug(header)
+                self.plugin.logger.debug(sep_mid)
+                for line in rows_str.splitlines():
+                    self.plugin.logger.debug(line)
+                self.plugin.logger.debug(sep_mid)
+                self.plugin.logger.debug(banner_bottom)
+
+            # 6) Save to Main device state
+            table_text = f"{banner_top}\n{header}\n{sep_mid}\n{rows_str}\n{sep_mid}\n{banner_bottom}"
+
+            main_dev = None
+            main_dev_id = self.plugin.pluginPrefs.get("main_device_id")
+            if main_dev_id:
+                try:
+                    main_dev = indigo.devices[int(main_dev_id)]
+                except Exception:
+                    main_dev = None
+            if not main_dev:
+                main_dev = next(
+                    (d for d in indigo.devices if d.deviceTypeId == "solarsmartMain" and d.enabled),
+                    None
+                )
+            if main_dev:
+                main_dev.updateStateOnServer("schedulerTable", table_text)
+            out_path = self._render_table_png(table_text, filename="scheduler.png")
+            if main_dev:
+                main_dev.updateStateOnServer("schedulerImagePath", out_path)
+
+        except Exception as e:
+            self.plugin.logger.error(f"Error building schedulerTable: {e}")
+
+
+    # ---------- Keep & Start logic ----------
+    def _evaluate_keep(self, dev: indigo.Device, headroom_w: int) -> int:
+        """
+        Decide whether to keep a running device ON.
+        - Respect min runtime.
+        - Use keep margin.
+        - If headroom too low AND min runtime met, stop it.
+        """
+        props = dev.pluginProps or {}
+        rated = _int(props.get("ratedWatts"), 0)
+        keep_margin = float(props.get("keepMarginPct", "5") or 5.0) / 100.0
+        min_runtime = _int(props.get("minRuntimeMins"), 0)
+
+        # Min runtime not met?
+        if not self._min_runtime_met(dev, min_runtime):
+            return headroom_w  # force keep even if headroom dips
+
+        # Check headroom with keep margin
+        needed = int(rated * (1.0 + keep_margin))
+        if headroom_w >= needed:
+            return headroom_w  # keep on
+
+        # Not enough room -> stop (cooldown applies)
+        self._ensure_off(dev, f"Headroom low for keep (need ≥ {needed}W, have {headroom_w}W)")
+        return headroom_w + rated  # freeing headroom approx by rated
+
+    def _try_start(self, dev: indigo.Device, headroom_w: int) -> tuple[bool, int]:
+        props = dev.pluginProps or {}
+        rated = _int(props.get("ratedWatts"), 0)
+        start_margin = float(props.get("startMarginPct", "20") or 20.0) / 100.0
+        surge_mult = float(props.get("surgeMultiplier", "1.2") or 1.2)
+        remaining = self._quota_remaining_mins(dev, props, datetime.now())
+        if remaining <= 0:
+            return (False, headroom_w)
+
+        # Cooldown check
+        if not self._cooldown_met(dev, _int(props.get("cooldownMins"), 0)):
+            return (False, headroom_w)
+
+        # Start threshold: rated * surge * (1+margin)
+        needed = int(rated * surge_mult * (1.0 + start_margin))
+        if getattr(self.plugin, "debug2", False):
+            self.plugin.logger.debug(
+                f"[THRESH] {dev.name}: needed={needed}W (rated={rated}, surge={surge_mult}, margin={start_margin * 100:.0f}%), headroom={headroom_w}W")
+
+        if headroom_w < needed:
+            return (False, headroom_w)
+
+        self._ensure_on(dev, "Start ok (threshold met)")
+        return (True, headroom_w - rated)  # approximate impact by rated watts
+
+    # ---------- Shedding ----------
+    def _shed_until_positive(self, headroom_w: int, running_by_tier: list[tuple[int, indigo.Device]]) -> int:
+        """Stop lowest-priority running devices until headroom is >= 0."""
+        if getattr(self.plugin, "debug2", False):
+            self.plugin.logger.debug(f"_shed_until_positive: starting headroom={headroom_w}W")
+        for tier, dev in running_by_tier:
+            if headroom_w >= 0:
+                break
+            # Allow breaking min-runtime only if you want a hard safety — here we allow it
+            self._ensure_off(dev, "Emergency shed (headroom negative)")
+            rated = _int(dev.pluginProps.get("ratedWatts"), 0)
+            headroom_w += rated
+        return headroom_w
+
+    # ========== Runtime/Quota/Cooldown state tracking ==========
+    def _is_running(self, dev: indigo.Device) -> bool:
+        return bool(self.plugin._load_state.get(dev.id, {}).get("running", False))
+
+    def _mark_running(self, dev: indigo.Device, running: bool):
+        st = self.plugin._load_state.setdefault(dev.id, {})
+        st["running"] = running
+        if running:
+            st.setdefault("start_ts", time.time())
+        else:
+            st.pop("start_ts", None)
+            # set cooldown start
+            st["cooldown_start"] = time.time()
+
+    def _served_quota_mins(self, dev: indigo.Device) -> int:
+        st = self.plugin._load_state.setdefault(dev.id, {})
+        return int(st.get("served_quota_mins", 0))
+
+    def _set_served_quota_mins(self, dev, minutes: int):
+        """Set served minutes and mirror to device state RuntimeQuotaMins."""
+        st = self.plugin._load_state.setdefault(dev.id, {})
+        st["served_quota_mins"] = int(minutes)
+        try:
+            dev.updateStateOnServer("RuntimeQuotaMins", int(minutes))
+        except Exception:
+            pass
+
+    def _add_served_minutes(self, dev, minutes: int):
+        """Increment served minutes and mirror to device state."""
+        self._set_served_quota_mins(dev, self._served_quota_mins(dev) + int(minutes))
+
+    def _min_runtime_met(self, dev: indigo.Device, min_runtime_mins: int) -> bool:
+        if min_runtime_mins <= 0:
+            return True
+        st = self.plugin._load_state.get(dev.id, {})
+        ts = st.get("start_ts")
+        if not ts:
+            return True
+        return (time.time() - ts) >= (min_runtime_mins * 60)
+
+    def _cooldown_met(self, dev: indigo.Device, cooldown_mins: int) -> bool:
+        if cooldown_mins <= 0:
+            return True
+        st = self.plugin._load_state.get(dev.id, {})
+        if self._is_running(dev):
+            return True
+        t0 = st.get("cooldown_start")
+        if not t0:
+            return True
+        return (time.time() - t0) >= (cooldown_mins * 60)
+
+    def _quota_remaining_mins(self, dev, props, now_dt: datetime) -> int:
+        """
+        Return remaining minutes for the quota window and update RemainingQuotaMins state.
+        Ensures the anchor is valid before computing.
+        """
+        self._ensure_quota_anchor(dev, props, time.time())
+        max_per_quota = int(props.get("maxRuntimePerQuotaMins") or 0) or 0
+        used = self._served_quota_mins(dev)
+        remaining = max(0, max_per_quota - used) if max_per_quota > 0 else 0
+        try:
+            dev.updateStateOnServer("RemainingQuotaMins", remaining)
+        except Exception:
+            pass
+        return remaining
+
+    def _quota_tick_minutes(self, period_sec: float) -> int:
+        """How many minutes to accrue per scheduler tick (usually 1 for a 60s tick)."""
+        return max(1, int(round(period_sec / 60.0)))
+
+    def _quota_horizon_minutes(self, period: str) -> int:
+        """Return the rolling quota horizon in minutes based on device props."""
+        return {
+            "12h": 12 * 60,
+            "24h": 24 * 60,
+            "1d": 24 * 60,
+            "2d": 48 * 60,
+            "3d": 72 * 60,
+        }.get((period or "24h").lower(), 24 * 60)
+
+    def _ensure_quota_anchor(self, dev, props, now_ts: float):
+        """
+        Ensure the quota accounting anchor exists and is fresh.
+        If the horizon has rolled over, reset served minutes & device states.
+        """
+        st = self.plugin._load_state.setdefault(dev.id, {})
+        period = (props.get("quotaWindow") or "24h").lower()
+        horizon_mins = self._quota_horizon_minutes(period)
+        anchor = st.get("quota_anchor_ts")
+
+        if (anchor is None) or ((now_ts - anchor) >= (horizon_mins * 60)):
+            st["quota_anchor_ts"] = now_ts
+            st["served_quota_mins"] = 0
+            # Reset visible device counters
+            try:
+                dev.updateStateOnServer("RuntimeQuotaMins", 0)  # RunMin
+                # Reset RemainingQuotaMins to the configured target (if set)
+                target = int(props.get("maxRuntimePerQuotaMins") or 0)
+                dev.updateStateOnServer("RemainingQuotaMins", target if target > 0 else 0)
+                # Optional: window runtime is per “allowed window”; reset here too
+                dev.updateStateOnServer("RuntimeWindowMins", 0)
+            except Exception:
+                pass
+
+
+
+    # ========== Actuation wrappers ==========
+    def _ensure_on(self, dev: indigo.Device, reason: str):
+        if self._is_running(dev):
+            return
+        self.plugin._execute_load_action(dev, turn_on=True, reason=reason)
+        self._mark_running(dev, True)
+        dev.updateStateOnServer("IsRunning", True)
+        dev.updateStateOnServer("StartedAt", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        dev.updateStateOnServer("LastReason", reason)
+        # start accruing runtime per tick in a separate tally
+        # (here we’ll add minutes on each scheduler pass if still running)
+
+    def _ensure_off(self, dev: indigo.Device, reason: str):
+        if not self._is_running(dev):
+            return
+        self.plugin._execute_load_action(dev, turn_on=False, reason=reason)
+        # account served minutes since start
+        st = self.plugin._load_state.get(dev.id, {})
+        ts = st.get("start_ts")
+        if ts:
+            mins = max(1, int(round((time.time() - ts) / 60.0)))
+            self._add_served_minutes(dev, mins)
+        self._mark_running(dev, False)
+        dev.updateStateOnServer("IsRunning", False)
+        dev.updateStateOnServer("Status", "OFF")
+        dev.updateStateOnServer("LastReason", reason)
+
+
+class Plugin(indigo.PluginBase):
+    def __init__(self, pluginId, pluginDisplayName, pluginVersion, pluginPrefs):
+        indigo.PluginBase.__init__(self, pluginId, pluginDisplayName, pluginVersion, pluginPrefs)
+
+        pfmt = logging.Formatter(
+            '%(asctime)s.%(msecs)03d\t%(levelname)s\t%(name)s.%(funcName)s:%(filename)s:%(lineno)s:\t%(message)s',
+            datefmt='%d-%m-%Y %H:%M:%S')
+        self.plugin_file_handler.setFormatter(pfmt)
+        ################################################################################
+        # Setup Logging
+        ################################################################################
+        self.logger.setLevel(logging.DEBUG)
+        try:
+            self.logLevel = int(self.pluginPrefs["showDebugLevel"])
+            self.fileloglevel = int(self.pluginPrefs["showDebugFileLevel"])
+        except:
+            self.logLevel = logging.INFO
+            self.fileloglevel = logging.DEBUG
+
+        self.logger.removeHandler(self.indigo_log_handler)
+        self.indigo_log_handler = IndigoLogHandler(pluginDisplayName, logging.INFO)
+        ifmt = logging.Formatter("%(message)s")
+        self.indigo_log_handler.setFormatter(ifmt)
+        self.indigo_log_handler.setLevel(self.logLevel)
+        self.logger.addHandler(self.indigo_log_handler)
+        self.pluginprefDirectory = '{}/Preferences/Plugins/com.GlennNZ.indigoplugin.SmartSolar'.format(indigo.server.getInstallFolderPath())
+
+        self.startingUp = True
+        self.pluginIsInitializing = True
+        self.pluginIsShuttingDown = False
+        self.prefsUpdated = False
+        self.logger.info(u"")
+        self.logger.info("{0:=^130}".format(" Initializing New Plugin Session "))
+        self.logger.info("{0:<30} {1}".format("Plugin name:", pluginDisplayName))
+        self.logger.info("{0:<30} {1}".format("Plugin version:", pluginVersion))
+        self.logger.info("{0:<30} {1}".format("Plugin ID:", pluginId))
+        self.logger.info("{0:<30} {1}".format("Indigo version:", indigo.server.version))
+        self.logger.info("{0:<30} {1}".format("Silicon version:", str(platform.machine())))
+
+        self.logger.info(u"{0:=^130}".format(""))
+
+        self.triggers = {}
+
+        # Change to logging
+        pfmt = logging.Formatter('%(asctime)s.%(msecs)03d\t[%(levelname)8s] %(name)20s.%(funcName)-25s%(msg)s',
+                                 datefmt='%Y-%m-%d %H:%M:%S')
+        self.plugin_file_handler.setFormatter(pfmt)
+
+        self.debug = self.pluginPrefs.get('showDebugInfo', False)
+        self.debug1 = self.pluginPrefs.get('debug1', False)
+        self.debug2 = self.pluginPrefs.get('debug2', False)
+        self.debug3 = self.pluginPrefs.get('debug3', False)
+        self.debug4 = self.pluginPrefs.get('debug4',False)
+        self.debug5 = self.pluginPrefs.get('debug5', False)
+        self.indigo_log_handler.setLevel(self.logLevel)
+        self.plugin_file_handler.setLevel(self.fileloglevel)
+        self.pluginIsInitializing = False
+
+    # ========================
+    # Core updater
+    # ========================
+    def _safe_int(self, v):
+        try:
+            if v in (None, "", "-1"):
+                return None
+            return int(str(v).strip())
+        except Exception:
+            return None
+
+
+    def _update_solarsmart_states(self, dev: indigo.Device) -> None:
+        """
+        Reads configured PV/Consumption/Battery, normalizes to Watts (numbers only),
+        computes Headroom best-effort, and publishes to the SolarSmart device states.
+        """
+        props = dev.pluginProps or {}
+
+        # --- Read numeric values ---
+        pv_w = self.read_pv_watts(props)  # required
+        cons_w = self.read_consumption_watts(props)  # optional
+        batt_w = self.read_battery_watts(props)  # optional
+
+        if getattr(self, "debug2", False):
+            self.logger.debug(f"_update_solarsmart_states: raw PV={pv_w}, Cons={cons_w}, Batt={batt_w}")
+
+        # --- Publish required + optional states ---
+        # If PV is missing (misconfig), publish 0 so UI isn’t blank and log it.
+        if pv_w is None:
+            if getattr(self, "debug2", False):
+                self.logger.debug("_update_solarsmart_states: PV missing -> publishing 0")
+            pv_w = 0.0
+
+        # Best-effort headroom (if consumption known). If batt_w is positive (charging), subtract it
+        # from headroom as it already consumes PV/export capacity. If negative (discharging), it adds headroom.
+        headroom = None
+        if cons_w is not None:
+            headroom = pv_w - cons_w
+            if batt_w is not None:
+                headroom -= max(batt_w, 0.0)  # subtract only charging power; negative (discharge) increases margin
+
+        # --- Push to server (Integers for W states) ---
+        try:
+            dev.updateStateOnServer("SolarProduction", int(round(pv_w)))
+        except Exception as e:
+            if getattr(self, "debug2", False):
+                self.logger.debug(f"Failed updating SolarProduction: {e}")
+
+        if cons_w is not None:
+            try:
+                dev.updateStateOnServer("SiteConsumption", int(round(cons_w)))
+            except Exception as e:
+                if getattr(self, "debug2", False):
+                    self.logger.debug(f"Failed updating SiteConsumption: {e}")
+
+        if batt_w is not None:
+            try:
+                dev.updateStateOnServer("BatteryPower", int(round(batt_w)))
+            except Exception as e:
+                if getattr(self, "debug2", False):
+                    self.logger.debug(f"Failed updating BatteryPower: {e}")
+
+        if headroom is not None:
+            try:
+                dev.updateStateOnServer("Headroom", int(round(headroom)))
+            except Exception as e:
+                if getattr(self, "debug2", False):
+                    self.logger.debug(f"Failed updating Headroom: {e}")
+
+        # Timestamp for sanity
+        try:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            dev.updateStateOnServer("LastUpdate", ts)
+        except Exception as e:
+            if getattr(self, "debug2", False):
+                self.logger.debug(f"Failed updating LastUpdate: {e}")
+
+        if getattr(self, "debug2", False):
+            self.logger.debug(
+                f"_update_solarsmart_states: published PV={pv_w}, Cons={cons_w}, Batt={batt_w}, Headroom={headroom}"
+            )
+
+    # ========================
+    # Small helper
+    # ========================
+
+    def _is_valid_choice(self, v) -> bool:
+        try:
+            return int(v) > 0
+        except Exception:
+            return False
+
+    def __del__(self):
+        if self.debugLevel >= 2:
+            self.debugLog(u"__del__ method called.")
+        indigo.PluginBase.__del__(self)
+
+    def closedDeviceConfigUi(self, valuesDict, userCancelled, typeId, devId):
+        """
+        Called after the Configure Device dialog closes.
+        We refresh the states immediately (if not cancelled).
+        """
+        if typeId != "solarsmartMain":
+            return valuesDict
+
+        if userCancelled:
+            if getattr(self, "debug2", False):
+                self.logger.debug(f"closedDeviceConfigUi: cancelled for device #{devId}")
+            return valuesDict
+
+        try:
+            dev = indigo.devices[devId]
+        except Exception:
+            return valuesDict
+
+        if getattr(self, "debug2", False):
+            self.logger.debug(f"closedDeviceConfigUi: applying immediate update for SolarSmart Main #{devId}")
+
+        # One-shot refresh using the (now saved) props
+        self._update_solarsmart_states(dev)
+        return valuesDict
+
+    def closedPrefsConfigUi(self, valuesDict, userCancelled):
+        self.debugLog(u"closedPrefsConfigUi() method called.")
+        if self.debug1:
+            self.logger.debug(f"valuesDict\n {valuesDict}")
+        if userCancelled:
+            self.debugLog(u"User prefs dialog cancelled.")
+        if not userCancelled:
+            self.logLevel = int(valuesDict.get("showDebugLevel", '5'))
+            self.fileloglevel = int(valuesDict.get("showDebugFileLevel", '5'))
+            self.debug1 = valuesDict.get('debug1', False)
+            self.debug2 = valuesDict.get('debug2', False)
+            self.debug3 = valuesDict.get('debug3', False)
+            self.debug4 = valuesDict.get('debug4', False)
+            self.debug5 = valuesDict.get('debug5', False)
+            self.debug6 = valuesDict.get('debug6', False)
+            self.debug7 = valuesDict.get('debug7', False)
+            self.debug8 = valuesDict.get('debug8', False)
+            self.debug9 = valuesDict.get('debug9', False)
+
+            self.indigo_log_handler.setLevel(self.logLevel)
+            self.plugin_file_handler.setLevel(self.fileloglevel)
+
+            self.logger.debug(u"logLevel = " + str(self.logLevel))
+            self.logger.debug(u"User prefs saved.")
+            self.logger.debug(u"Debugging on (Level: {0})".format(self.logLevel))
+
+
+
+        return True
+
+    # Start 'em up.
+    def deviceStartComm(self, dev):
+        """Indigo calls this when a device (of any type) starts communication."""
+        dev.stateListOrDisplayStateIdChanged()
+        if dev.deviceTypeId != "solarsmartMain":
+            return
+        if getattr(self, "debug2", False):
+            self.logger.debug(f"deviceStartComm: SolarSmart Main #{dev.id} starting")
+        # Push an immediate refresh of custom states on startup
+        if dev.deviceTypeId == "solarsmartMain":
+            self.pluginPrefs["main_device_id"] = str(dev.id)
+        self._update_solarsmart_states(dev)
+
+    # Shut 'em down.
+    def deviceStopComm(self, dev):
+        if self.debug1:
+            self.debugLog(u"deviceStopComm() method called.")
+
+
+    def shutdown(self):
+        self.debugLog(u"shutdown() method called.")
+
+    def startup(self):
+        self.debugLog(u"Starting Plugin. startup() method called.")
+        self.logger.debug("Checking Plugin Prefs Directory")
+        self._event_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._event_loop)
+        self._async_thread = threading.Thread(target=self._run_async_thread)
+        self._async_thread.start()
+
+        MAChome = os.path.expanduser("~") + "/"
+        self.saveDirectory = MAChome + "Pictures/Indigo-smartSolar/"
+        self.speakPath = os.path.join(self.pluginprefDirectory, "speak")
+
+        try:
+
+            if not os.path.exists(self.pluginprefDirectory):
+                os.makedirs(self.pluginprefDirectory)
+            if not os.path.exists(self.saveDirectory):
+                os.makedirs(self.saveDirectory)
+            speakpath = os.path.join(self.pluginprefDirectory, "speak")
+            if not os.path.exists(self.speakPath):
+                os.makedirs(self.speakPath)
+
+        except:
+            self.logger.error(u'Error Accessing Save and Peak Directory. ')
+            pass
+
+    def _run_async_thread(self):
+        self.logger.debug("_run_async_thread starting")
+        self._event_loop.create_task(self._async_start())
+        self._event_loop.run_until_complete(self._async_stop())
+        self._event_loop.close()
+
+    async def _async_start(self):
+        self.logger.debug("_async_start")
+        self.logger.debug("Starting event loop and setting up any connections")
+
+        # Create & start our async manager
+        self._ss_manager = SolarSmartAsyncManager(self, self._event_loop)
+        await self._ss_manager.start()
+
+    async def _async_stop(self):
+        # Poll for stop; when set, cancel async tasks cleanly
+        while True:
+            await asyncio.sleep(5.0)
+            if self.stopThread:
+                try:
+                    if hasattr(self, "_ss_manager") and self._ss_manager:
+                        await self._ss_manager.stop()
+                except Exception as e:
+                    self.logger.exception(f"_async_stop: error while stopping manager: {e}")
+                break
+    def validatePrefsConfigUi(self, valuesDict):
+
+        self.debugLog(u"validatePrefsConfigUi() method called.")
+        error_msg_dict = indigo.Dict()
+        return (True, valuesDict)
+
+        ## Generate QR COde for Homekit and open Web-Browser to display - is a PNG
+
+    def validateDeviceConfigUi(self, valuesDict, typeId, devId):
+        """
+        Extend your existing validate for solarsmartMain; validate solarsmartLoad here.
+        """
+        if typeId == "solarsmartMain":
+            # Keep your existing main validation here (PV device/state required)
+            pv_dev_ok = _is_valid_choice(valuesDict.get("pvDeviceId"))
+            pv_st_ok = bool(valuesDict.get("pvStateId") not in (None, "", "-1"))
+            if not pv_dev_ok or not pv_st_ok:
+                errorDict = indigo.Dict()
+                if not pv_dev_ok:
+                    errorDict["pvDeviceId"] = "Select a PV device."
+                if not pv_st_ok:
+                    errorDict["pvStateId"] = "Select the PV state."
+                return (False, valuesDict, errorDict)
+            return (True, valuesDict)
+
+        if typeId != "solarsmartLoad":
+            return (True, valuesDict)
+
+        errorDict = indigo.Dict()
+        ok = True
+
+        # Tier
+        try:
+            tier = int(valuesDict.get("tier", "2"))
+            if tier < 1 or tier > 4:
+                raise ValueError()
+        except Exception:
+            errorDict["tier"] = "Tier must be 1, 2, 3, or 4."
+            ok = False
+
+        # Power
+        try:
+            watts = int(float((valuesDict.get("ratedWatts") or "0").replace(",", "")))
+            if watts <= 0:
+                raise ValueError()
+        except Exception:
+            errorDict["ratedWatts"] = "Enter rated power (Watts), e.g., 2000."
+            ok = False
+
+        # Time window HH:MM
+        if not _valid_hhmm(valuesDict.get("windowStart", "")):
+            errorDict["windowStart"] = "Use HH:MM (e.g., 08:00)."
+            ok = False
+        if not _valid_hhmm(valuesDict.get("windowEnd", "")):
+            errorDict["windowEnd"] = "Use HH:MM (e.g., 20:00)."
+            ok = False
+
+        # DOW: require at least one checked
+        dow_keys = ["dowMon", "dowTue", "dowWed", "dowThu", "dowFri", "dowSat", "dowSun"]
+        if not any(valuesDict.get(k, False) in (True, "true", "True") for k in dow_keys):
+            errorDict["dowFri"] = "Select at least one allowed day."
+            ok = False
+
+        # Runtimes
+        if not _valid_pos_int(valuesDict.get("minRuntimeMins")):
+            errorDict["minRuntimeMins"] = "Enter minutes (positive integer)."
+            ok = False
+        if not _valid_pos_int(valuesDict.get("maxRuntimeMins")):
+            errorDict["maxRuntimeMins"] = "Enter minutes (positive integer)."
+            ok = False
+        if not _valid_pos_int(valuesDict.get("maxRuntimePerQuotaMins")):
+            errorDict["maxRuntimePerQuotaMins"] = "Enter minutes (positive integer)."
+            ok = False
+
+        # Control mode requirements
+        mode = valuesDict.get("controlMode", "actionGroup")
+        if mode == "actionGroup":
+            if not _is_valid_choice(valuesDict.get("onActionGroupId")):
+                errorDict["onActionGroupId"] = "Select an Action Group to turn ON."
+                ok = False
+            if not _is_valid_choice(valuesDict.get("offActionGroupId")):
+                errorDict["offActionGroupId"] = "Select an Action Group to turn OFF."
+                ok = False
+        else:
+            if not _is_valid_choice(valuesDict.get("controlDeviceId")):
+                errorDict["controlDeviceId"] = "Select the target device to control."
+                ok = False
+
+        if not ok:
+            return (False, valuesDict, errorDict)
+        return (True, valuesDict)
+
+    # ────────────────────────────────────────────────────────────
+    # Test ON/OFF callbacks (buttons in Devices.xml)
+    # ────────────────────────────────────────────────────────────
+
+    def test_on_clicked(self, valuesDict, typeId, devId):
+        return self._test_button_common(valuesDict, typeId, devId, turn_on=True)
+
+    def test_off_clicked(self, valuesDict, typeId, devId):
+        return self._test_button_common(valuesDict, typeId, devId, turn_on=False)
+
+    def _test_button_common(self, valuesDict, typeId, devId, turn_on: bool):
+        try:
+            dev = indigo.devices[devId]
+            if getattr(self, "debug2", False):
+                self.logger.debug(f"TEST {'ON' if turn_on else 'OFF'} clicked for #{devId} '{dev.name}'")
+
+            # Merge config: prefer valuesDict (unsaved), then device.pluginProps
+            props = self._merge_props(valuesDict or {}, dev.pluginProps or {})
+
+            ok, msg = self._validate_control_config_for_test(props)
+            if not ok:
+                self.logger.error(f"Test {'ON' if turn_on else 'OFF'}: {msg}")
+                dev.setErrorStateOnServer(msg)
+                return valuesDict
+
+            self._execute_load_action_with_props(dev, turn_on=turn_on,
+                                                 reason=f"Manual TEST {'ON' if turn_on else 'OFF'}", props=props)
+            dev.updateStateOnServer("Status", f"{'ON' if turn_on else 'OFF'} (test)")
+            dev.updateStateOnServer("LastReason", f"Manual TEST {'ON' if turn_on else 'OFF'}")
+
+        except Exception as e:
+            self.logger.exception(f"test_button_common error: {e}")
+        return valuesDict
+
+    def _merge_props(self, vd: dict, saved: dict) -> dict:
+        """Prefer valuesDict (unsaved UI) values; fall back to saved pluginProps."""
+        merged = dict(saved) if saved else {}
+        for k, v in (vd or {}).items():
+            # Indigo can pass booleans/strings; keep raw
+            merged[k] = v
+        return merged
+
+    def _validate_control_config_for_test(self, props: dict) -> tuple[bool, str]:
+        mode = (props.get("controlMode") or "actionGroup").strip()
+        if mode == "actionGroup":
+            on_ag = self._safe_int(props.get("onActionGroupId"))
+            off_ag = self._safe_int(props.get("offActionGroupId"))
+            if on_ag is None or on_ag <= 0 or off_ag is None or off_ag <= 0:
+                return False, "Select valid Action Groups for ON and OFF before testing."
+            return True, ""
+        else:
+            dev_id = self._safe_int(props.get("controlDeviceId"))
+            if dev_id is None or dev_id <= 0:
+                return False, "Select a target device before testing."
+            return True, ""
+
+    def _execute_load_action(self, load_dev: indigo.Device, turn_on: bool, reason: str, props: dict = None,
+                             update_states: bool = True):
+        """
+        Core method to turn a SmartSolar Load on or off.
+
+        Args:
+            load_dev      : The SmartSolar Load device object
+            turn_on       : True for ON, False for OFF
+            reason        : String describing why we're taking this action
+            props         : Optional props dict (if None, use load_dev.pluginProps)
+            update_states : Whether to mark IsRunning / LastReason in Indigo states
+        """
+        try:
+            # Props may be passed from TEST buttons, otherwise use saved props
+            props = props or (load_dev.pluginProps or {})
+            mode = (props.get("controlMode") or "actionGroup").strip()
+
+            if self.debug2:
+                self.logger.debug(
+                    f"_execute_load_action: {load_dev.name} => {'ON' if turn_on else 'OFF'} via {mode} | reason: {reason}")
+
+            if mode == "actionGroup":
+                ag_id = self._safe_int(props.get("onActionGroupId") if turn_on else props.get("offActionGroupId"))
+                if ag_id and ag_id > 0:
+                    indigo.actionGroup.execute(ag_id)
+                    if self.debug2:
+                        self.logger.debug(f"Executed Action Group #{ag_id} for {load_dev.name}")
+                else:
+                    raise ValueError(f"No valid Action Group ID for {load_dev.name}")
+
+            else:  # Device mode
+                target_id = self._safe_int(props.get("controlDeviceId"))
+                if not target_id or target_id <= 0:
+                    raise ValueError(f"No valid control device for {load_dev.name}")
+
+                on_cmd = (props.get("onCommand") or "turnOn").strip()
+                off_cmd = (props.get("offCommand") or "turnOff").strip()
+
+                if turn_on:
+                    if on_cmd == "toggle":
+                        indigo.device.toggle(target_id)
+                    else:
+                        indigo.device.turnOn(target_id)
+                else:
+                    if off_cmd == "toggle":
+                        indigo.device.toggle(target_id)
+                    else:
+                        indigo.device.turnOff(target_id)
+
+                if self.debug2:
+                    self.logger.debug(f"Sent {'ON' if turn_on else 'OFF'} to device #{target_id} for {load_dev.name}")
+
+            # If called from scheduler (or if explicitly told), update the states
+            if update_states:
+                load_dev.updateStateOnServer("IsRunning", turn_on)
+                load_dev.updateStateOnServer("LastReason", reason)
+                load_dev.updateStateOnServer("Status", "RUNNING" if turn_on else "OFF")
+
+        except Exception as e:
+            self.logger.error(f"Error executing action for {load_dev.name}: {e}")
+
+    def _execute_load_action_with_props(self, load_dev: indigo.Device, turn_on: bool, reason: str, props: dict):
+        """Fire ON/OFF using the provided props (valuesDict-merged). No scheduler side-effects."""
+        mode = (props.get("controlMode") or "actionGroup").strip()
+        if getattr(self, "debug2", False):
+            self.logger.debug(
+                f"_execute_load_action_with_props: {load_dev.name} -> {('ON' if turn_on else 'OFF')} via {mode} | {reason}")
+
+        if mode == "actionGroup":
+            ag_id = self._safe_int(props.get("onActionGroupId") if turn_on else props.get("offActionGroupId"))
+            if ag_id and ag_id > 0:
+                indigo.actionGroup.execute(ag_id)
+                if getattr(self, "debug2", False):
+                    self.logger.debug(f"Executed Action Group #{ag_id} for {load_dev.name}")
+            else:
+                raise ValueError("No valid Action Group selected for test.")
+        else:
+            target_id = self._safe_int(props.get("controlDeviceId"))
+            on_cmd = (props.get("onCommand") or "turnOn").strip()
+            off_cmd = (props.get("offCommand") or "turnOff").strip()
+            if not target_id or target_id <= 0:
+                raise ValueError("No valid control device selected for test.")
+
+            if turn_on:
+                if on_cmd == "toggle":
+                    indigo.device.toggle(target_id)
+                else:
+                    indigo.device.turnOn(target_id)
+            else:
+                if off_cmd == "toggle":
+                    indigo.device.toggle(target_id)
+                else:
+                    indigo.device.turnOff(target_id)
+
+            if getattr(self, "debug2", False):
+                self.logger.debug(f"Sent {'ON' if turn_on else 'OFF'} to device #{target_id} for {load_dev.name}")
+
+    def setStatestonil(self, dev):
+        if self.debug1:
+            self.debugLog(u'setStates to nil run')
+
+
+    def refreshDataAction(self, valuesDict):
+        """
+        The refreshDataAction() method refreshes data for all devices based on
+        a plugin menu call.
+        """
+        if self.debug1:
+            self.debugLog(u"refreshDataAction() method called.")
+        self.refreshData()
+        return True
+
+    def refreshData(self):
+        """
+        The refreshData() method controls the updating of all plugin
+        devices.
+        """
+        if self.debug1:
+            self.debugLog(u"refreshData() method called.")
+
+        try:
+            # Check to see if there have been any devices created.
+            if indigo.devices.itervalues(filter="self"):
+                if self.debugLevel >= 2:
+                    self.debugLog(u"Updating data...")
+
+                for dev in indigo.devices.itervalues(filter="self"):
+                    self.refreshDataForDev(dev)
+
+            else:
+                indigo.server.log(u"No Client devices have been created.")
+
+            return True
+
+        except Exception as error:
+            self.errorLog(u"Error refreshing devices. Please check settings.")
+            self.errorLog(unicode(error.message))
+            return False
+
+    def refreshDataForDev(self, dev):
+
+        if dev.configured:
+            if self.debug1:
+                self.debugLog(u"Found configured device: {0}".format(dev.name))
+
+            if dev.enabled:
+                if self.debug1:
+                    self.debugLog(u"   {0} is enabled.".format(dev.name))
+                timeDifference = int(t.time() - t.mktime(dev.lastChanged.timetuple()))
+
+            else:
+                if self.debug1:
+                    self.debugLog(u"    Disabled: {0}".format(dev.name))
+
+
+    def refreshDataForDevAction(self, valuesDict):
+        """
+        The refreshDataForDevAction() method refreshes data for a selected device based on
+        a plugin menu call.
+        """
+        if self.debug1:
+            self.debugLog(u"refreshDataForDevAction() method called.")
+
+        dev = indigo.devices[valuesDict.deviceId]
+
+        self.refreshDataForDev(dev)
+        return True
+
+    def stopSleep(self, start_sleep):
+        """
+        The stopSleep() method accounts for changes to the user upload interval
+        preference. The plugin checks every 2 seconds to see if the sleep
+        interval should be updated.
+        """
+        try:
+            total_sleep = float(self.pluginPrefs.get('configMenuUploadInterval', 300))
+        except:
+            total_sleep = iTimer  # TODO: Note variable iTimer is an unresolved reference.
+        if t.time() - start_sleep > total_sleep:
+            return True
+        return False
+
+    def toggleDebugEnabled(self):
+        """
+        Toggle debug on/off.
+        """
+        self.debugLog(u"toggleDebugEnabled() method called.")
+        if self.logLevel == logging.INFO:
+            self.logLevel = logging.DEBUG
+            self.indigo_log_handler.setLevel(self.logLevel)
+
+            indigo.server.log(u'Set Logging to DEBUG')
+        else:
+            self.logLevel = logging.INFO
+            indigo.server.log(u'Set Logging to INFO')
+            self.indigo_log_handler.setLevel(self.logLevel)
+
+        self.pluginPrefs[u"logLevel"] = self.logLevel
+        return
+        ## Triggers
+
+    ## Genereate Device lists
+
+    # ================================
+    # Dynamic menu list generators
+    # ================================
+    # ────────────────────────────────────────────────────────────
+    # Dynamic menus for solarsmartLoad
+    # ────────────────────────────────────────────────────────────
+
+    def action_group_list(self, filter="", valuesDict=None, typeId="", targetId=0):
+        """
+        Build a menu of Action Groups. Action Groups don't have an 'enabled' flag,
+        so we list them all.
+        """
+        items = [("-1", "— None —")]
+        try:
+            for ag in indigo.actionGroups:
+                items.append((str(ag.id), f"{ag.name} (#{ag.id})"))
+        except Exception as e:
+            if getattr(self, "debug3", False):
+                self.logger.debug(f"action_group_list: exception {e}")
+        items.sort(key=lambda t: t[1].lower())
+        if getattr(self, "debug3", False):
+            self.logger.debug(f"action_group_list: {len(items)} entries")
+        return items
+
+    def enabled_device_list(self, filter="", valuesDict=None, typeId="", targetId=0):
+        """All enabled Indigo devices (core + from loaded plugins)."""
+        return self._all_devices_menu(include_blank=True)
+
+    # ────────────────────────────────────────────────────────────
+    # ConfigUI callbacks (solarsmartLoad)
+    # ────────────────────────────────────────────────────────────
+
+    def control_mode_changed(self, valuesDict, typeId, devId):
+        mode = valuesDict.get("controlMode", "actionGroup")
+        if getattr(self, "debug2", False):
+            self.logger.debug(f"control_mode_changed: mode={mode} for device #{devId}")
+        if mode == "actionGroup":
+            valuesDict["controlDeviceId"] = "-1"
+            valuesDict["onCommand"] = "turnOn"
+            valuesDict["offCommand"] = "turnOff"
+        else:
+            valuesDict["onActionGroupId"] = "-1"
+            valuesDict["offActionGroupId"] = "-1"
+        return valuesDict
+
+    def control_device_changed(self, valuesDict, typeId, devId):
+        if getattr(self, "debug2", False):
+            self.logger.debug(
+                f"control_device_changed: deviceId={valuesDict.get('controlDeviceId')} for device #{devId}")
+        valuesDict["onCommand"] = "turnOn"
+        valuesDict["offCommand"] = "turnOff"
+        return valuesDict
+
+    # ────────────────────────────────────────────────────────────
+    # Menu generators (Devices.xml: <List class="self" method="…"/>)
+    # ────────────────────────────────────────────────────────────
+
+    # Menu generators
+    def pv_device_list(self, filter="", valuesDict=None, typeId="", targetId=0):
+        return self._all_devices_menu()
+
+    def consumption_device_list(self, filter="", valuesDict=None, typeId="", targetId=0):
+        return self._all_devices_menu(include_blank=True)
+
+    def battery_device_list(self, filter="", valuesDict=None, typeId="", targetId=0):
+        return self._all_devices_menu(include_blank=True)
+
+    def pv_state_list(self, filter="", valuesDict=None, typeId="", targetId=0):
+        dev_id = (valuesDict or {}).get("pvDeviceId")
+        return self._state_list_for_device(dev_id)
+
+    def consumption_state_list(self, filter="", valuesDict=None, typeId="", targetId=0):
+        dev_id = (valuesDict or {}).get("consDeviceId")
+        return self._state_list_for_device(dev_id, include_blank=True)
+
+    def battery_state_list(self, filter="", valuesDict=None, typeId="", targetId=0):
+        dev_id = (valuesDict or {}).get("battDeviceId")
+        return self._state_list_for_device(dev_id, include_blank=True)
+
+    # ────────────────────────────────────────────────────────────
+    # ConfigUI callbacks (Devices.xml: <CallbackMethod>…</CallbackMethod>)
+    # Reset dependent state fields when a device selection changes.
+    # Return valuesDict (and optionally errorsDict) per Indigo expectations.
+    # ────────────────────────────────────────────────────────────
+
+    # Callback resets — use sentinel "-1"
+    def pv_device_changed(self, valuesDict, typeId, devId):
+        valuesDict["pvStateId"] = "-1"
+        if getattr(self, "debug2", False):
+            self.logger.debug(f"pv_device_changed: set pvStateId=-1 (devId={valuesDict.get('pvDeviceId')})")
+        return valuesDict
+
+    def consumption_device_changed(self, valuesDict, typeId, devId):
+        valuesDict["consStateId"] = "-1"
+        if getattr(self, "debug2", False):
+            self.logger.debug(
+                f"consumption_device_changed: set consStateId=-1 (devId={valuesDict.get('consDeviceId')})")
+        return valuesDict
+
+    def battery_device_changed(self, valuesDict, typeId, devId):
+        valuesDict["battStateId"] = "-1"
+        if getattr(self, "debug2", False):
+            self.logger.debug(f"battery_device_changed: set battStateId=-1 (devId={valuesDict.get('battDeviceId')})")
+        return valuesDict
+
+    # ────────────────────────────────────────────────────────────
+    # Reading & normalizing selected states (numbers only)
+    # Use these in your poller/async loop to fetch Watts as numeric.
+    # They strip units like "kW", "W", " A", "V", etc., and parse numbers
+    # from strings like "2.34 kW" -> 2340.  Non-parsable becomes None.
+    # ────────────────────────────────────────────────────────────
+
+    def read_pv_watts(self, props: indigo.Dict) -> Optional[Number]:
+        """Return PV production in Watts as a number, or None."""
+        return self._read_numeric_state_watts(props.get("pvDeviceId"), props.get("pvStateId"))
+
+    def read_consumption_watts(self, props: indigo.Dict) -> Optional[Number]:
+        """Return site consumption in Watts as a number, or None if not configured."""
+        dev_id, state_id = props.get("consDeviceId"), props.get("consStateId")
+        if not dev_id or not state_id:
+            return None
+        return self._read_numeric_state_watts(dev_id, state_id)
+
+    def read_battery_watts(self, props: indigo.Dict) -> Optional[Number]:
+        """Return battery power in Watts as a number (+charge, -discharge if source uses that convention)."""
+        dev_id, state_id = props.get("battDeviceId"), props.get("battStateId")
+        if not dev_id or not state_id:
+            return None
+        return self._read_numeric_state_watts(dev_id, state_id)
+
+    # ────────────────────────────────────────────────────────────
+    # Internals
+    # ────────────────────────────────────────────────────────────
+    def _all_devices_menu(self, include_blank: bool = False):
+        items = []
+        if include_blank:
+            items.append(("-1", "— None —"))
+
+        for dev in indigo.devices:
+            if not dev.enabled:
+                if getattr(self, "debug3", False):
+                    self.logger.debug(f"Skip device #{dev.id} '{dev.name}': disabled")
+                continue
+
+            # If owned by a plugin, skip if plugin can't be retrieved (not loaded)
+            if dev.pluginId:
+                try:
+                    plugin_obj = indigo.server.getPlugin(dev.pluginId)  # 1 arg only
+                    if plugin_obj.isEnabled() == False:
+                        if getattr(self, "debug3", False):
+                            self.logger.debug(f"Skip device #{dev.id} '{dev.name}': plugin '{dev.pluginId}' not enabled")
+                        continue
+                    if self.debug3:
+                        self.logger.debug(f"Plugin for device #{dev.id} '{dev.name}': {plugin_obj}")
+                except Exception as e:
+                    if getattr(self, "debug3", False):
+                        self.logger.debug(f"Skip device #{dev.id} '{dev.name}': plugin '{dev.pluginId}' not found ({e})")
+                    continue
+
+                if plugin_obj is None:
+                    if getattr(self, "debug3", False):
+                        self.logger.debug(f"Skip device #{dev.id} '{dev.name}': plugin '{dev.pluginId}' not loaded")
+                    continue
+
+            model = getattr(dev, "model", "") or ""
+            label = f"{dev.name} [{model}] (#{dev.id})" if model else f"{dev.name} (#{dev.id})"
+            items.append((str(dev.id), label))
+
+        items.sort(key=lambda t: t[1].lower())
+        if getattr(self, "debug3", False):
+            self.logger.debug(f"_all_devices_menu built {len(items)} items (include_blank={include_blank})")
+        return items
+
+
+    def _state_list_for_device(self, dev_id, include_blank: bool = False):
+        items = []
+        if include_blank:
+            items.append(("-1", "— None —"))
+
+        # Accept None / "", "-1" as “no device selected”
+        try:
+            dev_id_int = int(dev_id)
+        except Exception:
+            dev_id_int = -1
+
+        if dev_id_int <= 0:
+            items.append(("-1", "— Select a device first —"))
+            if getattr(self, "debug3", False):
+                self.logger.debug("_state_list_for_device: no device selected")
+            return items
+
+        try:
+            dev = indigo.devices[dev_id_int]
+        except Exception as e:
+            if getattr(self, "debug3", False):
+                self.logger.debug(f"_state_list_for_device: device #{dev_id_int} not found ({e})")
+            items.append(("-1", "— Device not found —"))
+            return items
+
+        for key in sorted(dev.states.keys(), key=str.lower):
+            val = dev.states.get(key, "")
+            items.append((key, f"{key} == {val}"))
+
+        if getattr(self, "debug3", False):
+            self.logger.debug(f"_state_list_for_device: device #{dev_id_int} -> {len(items)} items")
+        return items
+
+    def _read_numeric_state_watts(self, dev_id_val: Any, state_key: Any) -> Optional[Number]:
+        """
+        Read a device.state, parse to Watts (number only). Handles:
+          - raw numeric (int/float)
+          - strings with units ('123 W', '1.2 kW', '1,234W', etc.)
+          - leading/trailing text ('Power: 750W', '750 watts')
+        Returns None if not available or unparsable.
+        """
+        try:
+            dev_id = int(dev_id_val)
+            key = str(state_key)
+        except Exception:
+            return None
+
+        try:
+            dev = indigo.devices[dev_id]
+            raw = dev.states.get(key, None)
+        except Exception:
+            return None
+
+        if raw is None:
+            return None
+
+        # If already numeric, treat as Watts.
+        if isinstance(raw, (int, float)):
+            return float(raw)
+
+        # Normalize strings
+        if isinstance(raw, str):
+            watts = _parse_to_watts(raw)
+            return watts
+
+        # Fallback: try str() then parse
+        return _parse_to_watts(str(raw))
+
+    # ────────────────────────────────────────────────────────────
+    # Parsing helpers (pure functions)
+    # ────────────────────────────────────────────────────────────
+
+    _NUM_RE = re.compile(r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)")
+
+    def _parse_to_watts(s: str) -> Optional[Number]:
+        """
+        Extract the first number and unit from a string and convert to Watts.
+        Supported hints:
+          - 'kW' => multiply by 1000
+          - 'W' or 'watt(s)' => as-is
+          - If no unit present, assume Watts
+        Examples:
+          '2.4 kW' -> 2400
+          '950 W' -> 950
+          'Power: 1,200w' -> 1200
+          '1.2e3' -> 1200 (assumed Watts)
+        """
+        if not s:
+            return None
+
+        s_clean = s.replace(",", "").strip()
+        m = _NUM_RE.search(s_clean)
+        if not m:
+            return None
+
+        try:
+            val = float(m.group(1))
+        except Exception:
+            return None
+
+        tail = s_clean[m.end():].lower()
+
+        # Unit inference
+        if "kw" in tail:
+            return val * 1000.0
+        if "w" in tail or "watt" in tail:
+            return val
+        # If the string before/after number mentions amps/volts, we don't convert — caller must compute P.
+        if "amp" in s_clean.lower() or "volt" in s_clean.lower():
+            return val  # best effort; caller can decide what to do
+
+        # Default: assume Watts
+        return val
+

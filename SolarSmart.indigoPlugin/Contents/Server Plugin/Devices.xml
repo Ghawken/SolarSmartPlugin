@@ -1,0 +1,350 @@
+<?xml version="1.0"?>
+<Devices>
+
+  <!-- SolarSmart main controller -->
+  <Device type="custom" id="solarsmartMain">
+    <Name>SolarSmart Main</Name>
+
+    <ConfigUI>
+      <!-- Intro -->
+      <Field id="intro" type="label" fontColor="blue" fontSize="large">
+        <Label>Select the Indigo device + state for PV, consumption, and battery power (Watts).</Label>
+      </Field>
+
+      <!-- ===== PV (required) ===== -->
+      <Field id="sep_pv" type="separator"/>
+      <Field id="pvHeader" type="label" fontColor="black" fontSize="medium">
+        <Label>Solar PV Production (Watts)</Label>
+      </Field>
+
+      <Field id="pvDeviceId" type="menu" defaultValue="">
+        <Label>PV Device:</Label>
+        <List class="self" method="pv_device_list" dynamicReload="true"/>
+        <CallbackMethod>pv_device_changed</CallbackMethod>
+      </Field>
+
+      <Field id="pvStateId" type="menu" defaultValue="">
+        <Label>PV State:</Label>
+        <List class="self" method="pv_state_list" dynamicReload="true"/>
+      </Field>
+
+      <!-- ===== Site Consumption (optional) ===== -->
+      <Field id="sep_cons" type="separator"/>
+      <Field id="consHeader" type="label" fontColor="black" fontSize="medium">
+        <Label>Site Consumption (Watts) — optional</Label>
+      </Field>
+
+      <Field id="consDeviceId" type="menu" defaultValue="">
+        <Label>Consumption Device:</Label>
+        <List class="self" method="consumption_device_list" dynamicReload="true"/>
+        <CallbackMethod>consumption_device_changed</CallbackMethod>
+      </Field>
+
+      <Field id="consStateId" type="menu" defaultValue="">
+        <Label>Consumption State:</Label>
+        <List class="self" method="consumption_state_list" dynamicReload="true"/>
+      </Field>
+
+      <!-- ===== Battery Power (optional) ===== -->
+      <Field id="sep_batt" type="separator"/>
+      <Field id="battHeader" type="label" fontColor="black" fontSize="medium">
+        <Label>Battery Power (Watts; + = charging, − = discharging) — optional</Label>
+      </Field>
+
+      <Field id="battDeviceId" type="menu" defaultValue="">
+        <Label>Battery Device:</Label>
+        <List class="self" method="battery_device_list" dynamicReload="true"/>
+        <CallbackMethod>battery_device_changed</CallbackMethod>
+      </Field>
+
+      <Field id="battStateId" type="menu" defaultValue="">
+        <Label>Battery State:</Label>
+        <List class="self" method="battery_state_list" dynamicReload="true"/>
+      </Field>
+ <Field id="sep_hint_2" type="separator"/>
+        <Field id="maxConcurrentLoads" type="textfield" defaultValue="2">
+    <Label>Max Concurrent Loads</Label>
+    <Description>Maximum number of SmartSolar loads allowed to run simultaneously.</Description>
+  </Field>
+      <!-- ===== Hints ===== -->
+      <Field id="sep_hint" type="separator"/>
+      <Field id="hint" type="label" fontColor="darkgray" fontSize="small" alwaysUseInDialogHeightCalc="true">
+        <Label>Values are expected in Watts. If your source is kW or a string, normalize in the plugin before updating states.</Label>
+      </Field>
+
+
+
+
+    </ConfigUI>
+
+    <!-- Show PV production in device list -->
+    <UiDisplayStateId>SolarProduction</UiDisplayStateId>
+
+    <States>
+      <State id="SolarProduction">
+        <ValueType>Integer</ValueType>
+        <TriggerLabel>Solar production changed</TriggerLabel>
+        <ControlPageLabel>Solar production (W)</ControlPageLabel>
+      </State>
+
+      <State id="SiteConsumption">
+        <ValueType>Integer</ValueType>
+        <TriggerLabel>Site consumption changed</TriggerLabel>
+        <ControlPageLabel>Site consumption (W)</ControlPageLabel>
+      </State>
+
+      <State id="BatteryPower">
+        <ValueType>Integer</ValueType>
+        <TriggerLabel>Battery power changed</TriggerLabel>
+        <ControlPageLabel>Battery power (W)</ControlPageLabel>
+      </State>
+
+      <!-- Optional computed helper, populated by the plugin -->
+      <State id="Headroom">
+        <ValueType>Integer</ValueType>
+        <TriggerLabel>Headroom changed</TriggerLabel>
+        <ControlPageLabel>Available headroom (W)</ControlPageLabel>
+      </State>
+
+      <State id="LastUpdate">
+        <ValueType>String</ValueType>
+        <TriggerLabel>Last update changed</TriggerLabel>
+        <ControlPageLabel>Last updated</ControlPageLabel>
+      </State>
+
+      <State id="schedulerTable">
+    <ValueType>String</ValueType>
+    <TriggerLabel>Scheduler Table</TriggerLabel>
+    <ControlPageLabel>Scheduler Table</ControlPageLabel>
+</State>
+<State id="schedulerImageURL">
+  <ValueType>String</ValueType>
+  <TriggerLabel>Scheduler Image URL</TriggerLabel>
+  <ControlPageLabel>Scheduler Image URL</ControlPageLabel>
+</State>
+<State id="schedulerImagePath">
+  <ValueType>String</ValueType>
+  <TriggerLabel>Scheduler Image Path</TriggerLabel>
+  <ControlPageLabel>Scheduler Image Path</ControlPageLabel>
+</State>
+    </States>
+  </Device>
+
+  <!-- ===================== -->
+<!-- SolarSmart Load device -->
+<!-- ===================== -->
+<Device type="custom" id="solarsmartLoad">
+  <Name>SolarSmart Load</Name>
+
+  <ConfigUI>
+    <!-- Intro -->
+    <Field id="intro" type="label" fontColor="blue" fontSize="large">
+      <Label>Configure a controllable load (priority, power, time windows, and how to switch it ON/OFF).</Label>
+    </Field>
+
+    <!-- Tier / Power -->
+    <Field id="sep_tier" type="separator"/>
+    <Field id="tier" type="menu" defaultValue="2">
+      <Label>Priority Tier:</Label>
+      <List>
+        <Option value="1">Tier 1 (highest)</Option>
+        <Option value="2">Tier 2</Option>
+        <Option value="3">Tier 3</Option>
+        <Option value="4">Tier 4</Option>
+      </List>
+    </Field>
+
+    <Field id="ratedWatts" type="textfield" defaultValue="2000">
+      <Label>Rated Power (Watts):</Label>
+    </Field>
+
+    <!-- Control mode -->
+    <Field id="sep_ctrl" type="separator"/>
+    <Field id="controlMode" type="menu" defaultValue="actionGroup">
+      <Label>Control Method:</Label>
+      <List>
+        <Option value="actionGroup">Use Action Groups</Option>
+        <Option value="device">Control an Indigo Device (On/Off)</Option>
+      </List>
+      <CallbackMethod>control_mode_changed</CallbackMethod>
+    </Field>
+
+    <!-- Action Group control -->
+    <Field id="onActionGroupId" type="menu" defaultValue="-1" visibleBindingId="controlMode" visibleBindingValue="actionGroup">
+      <Label>Action Group (ON):</Label>
+      <List class="self" method="action_group_list" dynamicReload="true"/>
+    </Field>
+    <Field id="offActionGroupId" type="menu" defaultValue="-1" visibleBindingId="controlMode" visibleBindingValue="actionGroup">
+      <Label>Action Group (OFF):</Label>
+      <List class="self" method="action_group_list" dynamicReload="true"/>
+    </Field>
+
+    <!-- Device control -->
+    <Field id="controlDeviceId" type="menu" defaultValue="-1" visibleBindingId="controlMode" visibleBindingValue="device">
+      <Label>Target Device:</Label>
+      <List class="self" method="enabled_device_list" dynamicReload="true"/>
+      <CallbackMethod>control_device_changed</CallbackMethod>
+    </Field>
+    <Field id="onCommand" type="menu" defaultValue="turnOn" visibleBindingId="controlMode" visibleBindingValue="device">
+      <Label>ON Command:</Label>
+      <List>
+        <Option value="turnOn">Turn On</Option>
+        <Option value="toggle">Toggle</Option>
+      </List>
+    </Field>
+    <Field id="offCommand" type="menu" defaultValue="turnOff" visibleBindingId="controlMode" visibleBindingValue="device">
+      <Label>OFF Command:</Label>
+      <List>
+        <Option value="turnOff">Turn Off</Option>
+        <Option value="toggle">Toggle</Option>
+      </List>
+    </Field>
+    <Field id="sep_test" type="separator"/>
+    <Field id="testOn" type="button" fontSize="medium" fontColor="blue">
+      <Label>Test ON</Label>
+      <Title>Test ON</Title>
+      <CallbackMethod>test_on_clicked</CallbackMethod>
+    </Field>
+    <Field id="testOff" type="button" fontSize="medium" fontColor="blue">
+      <Label>Test OFF</Label>
+      <Title>Test OFF</Title>
+      <CallbackMethod>test_off_clicked</CallbackMethod>
+    </Field>
+    <!-- Time windows -->
+    <Field id="sep_time" type="separator"/>
+    <Field id="windowStart" type="textfield" defaultValue="08:00">
+      <Label>Allowed Window Start (HH:MM):</Label>
+    </Field>
+    <Field id="windowEnd" type="textfield" defaultValue="20:00">
+      <Label>Allowed Window End (HH:MM):</Label>
+    </Field>
+
+    <!-- Days of week -->
+    <Field id="dowHeader" type="label" fontColor="black" fontSize="medium">
+      <Label>Allowed Days of Week:</Label>
+    </Field>
+    <Field id="dowMon" type="checkbox" defaultValue="true"><Label>Monday</Label></Field>
+    <Field id="dowTue" type="checkbox" defaultValue="true"><Label>Tuesday</Label></Field>
+    <Field id="dowWed" type="checkbox" defaultValue="true"><Label>Wednesday</Label></Field>
+    <Field id="dowThu" type="checkbox" defaultValue="true"><Label>Thursday</Label></Field>
+    <Field id="dowFri" type="checkbox" defaultValue="true"><Label>Friday</Label></Field>
+    <Field id="dowSat" type="checkbox" defaultValue="true"><Label>Saturday</Label></Field>
+    <Field id="dowSun" type="checkbox" defaultValue="true"><Label>Sunday</Label></Field>
+
+    <!-- Runtime constraints -->
+    <Field id="sep_runtime" type="separator"/>
+    <Field id="minRuntimeMins" type="textfield" defaultValue="30">
+      <Label>Minimum Runtime (minutes):</Label>
+    </Field>
+    <Field id="maxRuntimeMins" type="textfield" defaultValue="120">
+      <Label>Maximum Runtime per Window (minutes):</Label>
+    </Field>
+
+    <!-- Quota window -->
+    <Field id="quotaHeader" type="label" fontColor="black" fontSize="medium">
+      <Label>Quota Window (rolling):</Label>
+    </Field>
+    <Field id="quotaWindow" type="menu" defaultValue="24h">
+      <Label>Quota Period:</Label>
+      <List>
+        <Option value="12h">12 hours</Option>
+        <Option value="24h">24 hours</Option>
+        <Option value="1d">1 day</Option>
+        <Option value="2d">2 days</Option>
+        <Option value="3d">3 days</Option>
+      </List>
+    </Field>
+    <Field id="maxRuntimePerQuotaMins" type="textfield" defaultValue="180">
+      <Label>Max Runtime per Quota Window (minutes):</Label>
+    </Field>
+
+    <!-- Scheduler nuances -->
+    <Field id="sep_sched" type="separator"/>
+    <Field id="mutexGroup" type="textfield" defaultValue="">
+      <Label>Mutual-Exclusion Group (optional):</Label>
+    </Field>
+    <Field id="cooldownMins" type="textfield" defaultValue="10">
+      <Label>Cooldown After Stop (minutes):</Label>
+    </Field>
+    <Field id="startMarginPct" type="textfield" defaultValue="20">
+      <Label>Start Margin (% above rated Watts):</Label>
+    </Field>
+    <Field id="keepMarginPct" type="textfield" defaultValue="5">
+      <Label>Keep-On Margin (% above rated Watts):</Label>
+    </Field>
+    <Field id="surgeMultiplier" type="textfield" defaultValue="1.2">
+      <Label>Start Surge Multiplier:</Label>
+    </Field>
+
+    <!-- Save hint -->
+    <Field id="sep_hint" type="separator"/>
+    <Field id="hint" type="label" fontColor="darkgray" fontSize="small" alwaysUseInDialogHeightCalc="true">
+      <Label>Tip: leave Mutex Group blank unless this load must never run with certain others (e.g., "PoolGroup").</Label>
+    </Field>
+
+  </ConfigUI>
+
+  <!-- Primary display -->
+  <UiDisplayStateId>Status</UiDisplayStateId>
+
+  <States>
+    <State id="Status">
+      <ValueType>String</ValueType>
+      <TriggerLabel>Load status</TriggerLabel>
+      <ControlPageLabel>Load status</ControlPageLabel>
+    </State>
+
+    <State id="IsRunning">
+      <ValueType>Boolean</ValueType>
+      <TriggerLabel>Is running changed</TriggerLabel>
+      <ControlPageLabel>Running</ControlPageLabel>
+    </State>
+
+    <State id="Tier">
+      <ValueType>Integer</ValueType>
+      <TriggerLabel>Tier changed</TriggerLabel>
+      <ControlPageLabel>Tier</ControlPageLabel>
+    </State>
+
+    <State id="PowerRated">
+      <ValueType>Integer</ValueType>
+      <TriggerLabel>Rated power changed</TriggerLabel>
+      <ControlPageLabel>Rated W</ControlPageLabel>
+    </State>
+
+    <State id="StartedAt">
+      <ValueType>String</ValueType>
+      <TriggerLabel>Start time changed</TriggerLabel>
+      <ControlPageLabel>Started</ControlPageLabel>
+    </State>
+
+    <State id="RuntimeWindowMins">
+      <ValueType>Integer</ValueType>
+      <TriggerLabel>Window runtime changed</TriggerLabel>
+      <ControlPageLabel>Runtime (window, min)</ControlPageLabel>
+    </State>
+
+    <State id="RuntimeQuotaMins">
+      <ValueType>Integer</ValueType>
+      <TriggerLabel>Quota runtime changed</TriggerLabel>
+      <ControlPageLabel>Runtime (quota, min)</ControlPageLabel>
+    </State>
+
+    <State id="RemainingQuotaMins">
+      <ValueType>Integer</ValueType>
+      <TriggerLabel>Remaining quota changed</TriggerLabel>
+      <ControlPageLabel>Remaining quota (min)</ControlPageLabel>
+    </State>
+
+    <State id="LastReason">
+      <ValueType>String</ValueType>
+      <TriggerLabel>Last decision reason changed</TriggerLabel>
+      <ControlPageLabel>Reason</ControlPageLabel>
+    </State>
+  </States>
+</Device>
+
+
+
+</Devices>
+
