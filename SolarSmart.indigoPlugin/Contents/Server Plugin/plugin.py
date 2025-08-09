@@ -694,25 +694,31 @@ class SolarSmartAsyncManager:
             self.plugin.logger.debug("===== LOAD SCHEDULER TICK =====")
             self.plugin.logger.debug(f"Initial headroom: {headroom_w} W")
 
-        # Build list of currently running
+        # Build list of currently running (tier, dev), lowest priority first for shedding
         running_pairs = []
         for tier, devs in loads_by_tier.items():
             for d in devs:
                 if self._is_running(d):
                     running_pairs.append((tier, d))
-        running_pairs.sort(key=lambda x: x[0], reverse=True)
+        # Sort so that highest tier numbers (lowest priority) are last
+        running_pairs.sort(key=lambda x: x[0], reverse=False)
 
-        # Shed if already negative
+        # If negative headroom, shed exactly ONE load first, then re-evaluate next tick
         if headroom_w < 0 and running_pairs:
             headroom_w = self._shed_until_positive(headroom_w, running_pairs)
 
+        # Recompute running count after potential shed
         running_now = sum(1 for _, d in running_pairs if self._is_running(d))
 
-        # Process tiers
+        # Process tiers in priority order
         for tier, devs in sorted(loads_by_tier.items()):
             for d in devs:
                 props = d.pluginProps or {}
-                rated = _int(props.get("ratedWatts"), 0)
+                try:
+                    rated = int(float(props.get("ratedWatts", 0)) or 0)
+                except Exception:
+                    rated = 0
+
                 remaining = self._quota_remaining_mins(d, props, datetime.now())
                 surge_mult = float(props.get("surgeMultiplier", "1.2") or 1.2)
                 start_margin = float(props.get("startMarginPct", "20") or 20.0) / 100.0
@@ -723,18 +729,21 @@ class SolarSmartAsyncManager:
                 before_headroom = headroom_w
 
                 if self._is_running(d):
+                    # KEEP/STOP decision (your existing logic)
                     headroom_w = self._evaluate_keep(d, headroom_w)
                     action = "KEEP"
                 else:
+                    # start constraints
                     if starts_this_tick >= 1:
                         action = "SKIP (cap)"
                     elif running_now >= max_concurrent:
                         action = "SKIP (conc)"
                     elif remaining <= 0:
                         action = "SKIP (quota)"
-                    elif not self._cooldown_met(d, _int(props.get("cooldownMins"), 0)):
+                    elif not self._cooldown_met(d, int(props.get("cooldownMins") or 0)):
                         action = "SKIP (cooldn)"
                     elif headroom_w >= needed_w:
+                        # Start exactly ONE load per tick
                         self._ensure_on(d, "Start ok (threshold met)")
                         headroom_w -= rated
                         starts_this_tick += 1
@@ -743,20 +752,13 @@ class SolarSmartAsyncManager:
                     else:
                         action = "SKIP (headrm)"
 
-                table_rows.append((
-                    tier,
-                    d.name,
-                    rated,
-                    status,
-                    remaining,
-                    before_headroom,
-                    needed_w,
-                    action
-                ))
+                # (if you still build the table, append row here)
+                table_rows.append((tier, d.name, rated, status, remaining, before_headroom, needed_w, action))
 
-        # Final safety shed
-        if headroom_w < 0 and running_pairs:
-            headroom_w = self._shed_until_positive(headroom_w, running_pairs)
+        # OPTIONAL: final safety shed — shed only ONE more if still negative.
+        # Comment this block out if you want strictly one action TOTAL per tick.
+        # if headroom_w < 0 and running_pairs:
+         #   headroom_w = self._shed_until_positive(headroom_w, running_pairs)
 
         # Print summary table
         # At end of _schedule_by_tier()
@@ -923,17 +925,70 @@ class SolarSmartAsyncManager:
         return (True, headroom_w - rated)  # approximate impact by rated watts
 
     # ---------- Shedding ----------
+    # ---------- Shedding (one at a time) ----------
     def _shed_until_positive(self, headroom_w: int, running_by_tier: list[tuple[int, indigo.Device]]) -> int:
-        """Stop lowest-priority running devices until headroom is >= 0."""
-        if getattr(self.plugin, "debug2", False):
-            self.plugin.logger.debug(f"_shed_until_positive: starting headroom={headroom_w}W")
+        """
+        Shed exactly ONE running device to improve (ideally fix) negative headroom.
+        Strategy:
+          1) If headroom >= 0 -> no-op.
+          2) Among running loads, prefer lowest-priority (highest tier).
+          3) Try to pick the smallest rated load that covers the deficit.
+          4) If none can cover the deficit alone, shed the smallest load in the lowest priority.
+        Returns the new headroom after shedding that one device.
+        """
+        dbg = getattr(self.plugin, "debug2", False)
+        if headroom_w >= 0 or not running_by_tier:
+            if dbg:
+                self.plugin.logger.debug(f"_shed_until_positive: headroom ok ({headroom_w}W) or no running loads")
+            return headroom_w
+
+        deficit = -headroom_w
+        if dbg:
+            self.plugin.logger.debug(f"_shed_until_positive: starting headroom={headroom_w}W (deficit={deficit}W)")
+
+        # Build candidate list: (tier, dev, rated)
+        candidates = []
         for tier, dev in running_by_tier:
-            if headroom_w >= 0:
-                break
-            # Allow breaking min-runtime only if you want a hard safety — here we allow it
-            self._ensure_off(dev, "Emergency shed (headroom negative)")
-            rated = _int(dev.pluginProps.get("ratedWatts"), 0)
-            headroom_w += rated
+            try:
+                rated = int(float((dev.pluginProps or {}).get("ratedWatts", 0)) or 0)
+            except Exception:
+                rated = 0
+            if self._is_running(dev) and rated > 0:
+                candidates.append((tier, dev, rated))
+
+        if not candidates:
+            if dbg:
+                self.plugin.logger.debug("_shed_until_positive: no valid running candidates to shed")
+            return headroom_w
+
+        # Prefer lowest priority (highest tier). Within that, pick the smallest rated that fixes the deficit.
+        # Split into two sets for clarity: those that can fix, those that can't.
+        candidates.sort(key=lambda tdr: (tdr[0], tdr[2]))  # tier asc first; we’ll reverse for lowest priority
+        # Lowest priority tier value:
+        max_tier = max(t for t, _, _ in candidates)
+
+        in_lowest_priority = [x for x in candidates if x[0] == max_tier]
+        can_fix = [x for x in in_lowest_priority if x[2] >= deficit]
+        if can_fix:
+            # pick the smallest that fixes
+            tier, dev, rated = sorted(can_fix, key=lambda tdr: tdr[2])[0]
+            choice_reason = f"lowest-priority tier {tier}, minimal rated covering deficit"
+        else:
+            # None in lowest priority can fix; shed smallest in lowest priority to be gentle
+            tier, dev, rated = sorted(in_lowest_priority, key=lambda tdr: tdr[2])[0]
+            choice_reason = f"lowest-priority tier {tier}, smallest rated (partial improvement)"
+
+        if dbg:
+            self.plugin.logger.debug(
+                f"_shed_until_positive: shedding ONE → {dev.name} (tier={tier}, rated={rated}W) — {choice_reason}"
+            )
+
+        self._ensure_off(dev, "Emergency shed (headroom negative)")
+        headroom_w += rated
+
+        if dbg:
+            self.plugin.logger.debug(f"_shed_until_positive: new headroom={headroom_w}W after shedding {dev.name}")
+
         return headroom_w
 
     # ========== Runtime/Quota/Cooldown state tracking ==========
