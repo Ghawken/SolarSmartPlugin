@@ -66,13 +66,12 @@
     <Label>Max Concurrent Loads</Label>
     <Description>Maximum number of SmartSolar loads allowed to run simultaneously.</Description>
   </Field>
+
       <!-- ===== Hints ===== -->
       <Field id="sep_hint" type="separator"/>
       <Field id="hint" type="label" fontColor="darkgray" fontSize="small" alwaysUseInDialogHeightCalc="true">
         <Label>Values are expected in Watts. If your source is kW or a string, normalize in the plugin before updating states.</Label>
       </Field>
-
-
 
 
     </ConfigUI>

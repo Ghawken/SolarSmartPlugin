@@ -19,6 +19,9 @@ import traceback
 import asyncio
 import threading
 import platform
+
+from pygments.filters import RaiseOnErrorTokenFilter
+
 try:
     import indigo
 except:
@@ -140,8 +143,29 @@ class SolarSmartAsyncManager:
         self.plugin = plugin
         self.loop = event_loop
         self._tasks = []
+        # Log instantiation so it shows up in Indigo logs
+        try:
+            self.plugin.logger.info("SolarSmart AsyncManager initialised — async loop manager ready.")
+        except Exception as e:
+            # Fallback to Indigo's logger if plugin.logger isn't ready yet
+            import indigo
+            indigo.server.log(f"SolarSmartAsyncManager initialised (logger not ready: {e})", isError=True)
 
     # ----- lifecycle -----
+    def _track_task(self, coro, name: str):
+        async def _runner():
+            try:
+                await coro
+            except asyncio.CancelledError:
+                if getattr(self.plugin, "debug5", False):
+                    self.plugin.logger.debug(f"Task '{name}' cancelled.")
+            except Exception:
+                self.plugin.logger.exception(f"Task '{name}' crashed")
+
+        task = self.loop.create_task(_runner())
+        self._tasks.append(task)
+        return task
+
 
     async def start(self):
         """Schedule forever loops. Call once from _async_start()."""
@@ -149,10 +173,11 @@ class SolarSmartAsyncManager:
             self.plugin.logger.debug("SolarSmartAsyncManager.start()")
 
         # Main 30s ticker (pv/consumption/battery -> publish states)
-        self._tasks.append(self.loop.create_task(self._ticker_main_states(period_sec=30.0)))
-
-        # (Future) add other forever tasks here (e.g., load scheduler)
-        self._tasks.append(self.loop.create_task(self._ticker_load_scheduler(period_sec=60.0)))
+        #self._tasks.append(self.loop.create_task(self._ticker_main_states(period_sec=30.0)))
+        asyncio.sleep(5)
+        self._track_task(self._ticker_main_states(period_sec=30.0), "main_states")
+        self._track_task(self._ticker_load_scheduler(period_min=self.plugin.time_for_checks_frequency),
+                         "load_scheduler")
 
     async def stop(self):
         """Cancel all tasks gracefully."""
@@ -188,6 +213,45 @@ class SolarSmartAsyncManager:
             self.plugin.logger.debug(f"maxConcurrentLoads (from Main #{main.id if main else 'n/a'}) = {val}")
         return val
 
+    def _fmt_w(self, v) -> str:
+        try:
+            return f"{int(round(float(v)))} W"
+        except Exception:
+            return "—"
+
+    def _get_main_device(self):
+        # prefer configured main; fallback to first enabled main
+        main_dev = None
+        main_dev_id = self.plugin.pluginPrefs.get("main_device_id")
+        if main_dev_id:
+            try:
+                main_dev = indigo.devices[int(main_dev_id)]
+            except Exception:
+                main_dev = None
+        if not main_dev:
+            main_dev = next((d for d in indigo.devices
+                             if d.deviceTypeId == "solarsmartMain" and d.enabled), None)
+        return main_dev
+
+    def _snapshot_main_metrics(self):
+        """Return (pv_w, cons_w, batt_w, headroom_w, ts_str) from the main device states."""
+        main = self._get_main_device()
+        if not main:
+            return (None, None, None, None, None)
+        try:
+            pv = main.states.get("SolarProduction", None)
+            con = main.states.get("SiteConsumption", None)
+            bat = main.states.get("BatteryPower", None)
+            hdrm = main.states.get("Headroom", None)
+            ts = main.states.get("LastUpdate", None)
+            # coerce to ints if possible
+            pv = None if pv is None else int(pv)
+            con = None if con is None else int(con)
+            bat = None if bat is None else int(bat)
+            hdrm = None if hdrm is None else int(hdrm)
+            return (pv, con, bat, hdrm, ts)
+        except Exception:
+            return (None, None, None, None, None)
 
     async def _ticker_main_states(self, period_sec: float):
         """
@@ -259,11 +323,18 @@ class SolarSmartAsyncManager:
                 self._ensure_off(dev, reason)
 
 
-    async def _ticker_load_scheduler(self, period_sec: float):
+    async def _ticker_load_scheduler(self, period_min: float):
         """
         Every ~period_sec: decide which solarsmartLoad devices should be ON/OFF
         given current headroom, priorities, windows, quotas, and hysteresis.
         """
+        if getattr(self.plugin, "debug2", False):
+            self.plugin.logger.debug(f"_ticker_load_scheduler: starting (period={period_min} minutes)")
+        try:
+            period_sec = max(1, int(round(float(period_min) * 60.0)))
+        except Exception:
+            period_sec = 60  # fallback to 60s if pref is weird
+
         if getattr(self.plugin, "debug2", False):
             self.plugin.logger.debug(f"_ticker_load_scheduler: starting (period={period_sec}s)")
 
@@ -707,21 +778,25 @@ class SolarSmartAsyncManager:
 
         # If removing this load's rated draw still leaves us NEGATIVE beyond hysteresis → stop it.
         # i.e., (headroom - rated) < -hysteresis
-        if (headroom_w - rated) < (0 - hysteresis_w):
+        if (headroom_w ) < (0 - hysteresis_w):
             return f"Headroom low (need {rated}W, have {headroom_w}W)"
 
         return None
 
     def _schedule_by_tier(self, loads_by_tier: dict[int, list[indigo.Device]], headroom_w: int):
-        dbg = getattr(self.plugin, "debug2", False)
+
         max_concurrent = self._get_max_concurrent_loads()
         starts_this_tick = 0
 
         table_rows = []  # for final summary table
 
+        pv, con, bat, hdrm, ts = self._snapshot_main_metrics()
+        headroom_w = hdrm if hdrm is not None else 0
+
+        dbg = getattr(self.plugin, "debug2", False)
         if dbg:
-            self.plugin.logger.debug("===== LOAD SCHEDULER TICK =====")
-            self.plugin.logger.debug(f"Initial headroom: {headroom_w} W")
+            self.plugin.logger.debug(f"===== LOAD SCHEDULER TICK =====")
+            self.plugin.logger.debug(f"Observed headroom from Main: {headroom_w} W (PV={pv}, Load={con}, Batt={bat})")
 
         # Build list of currently running (tier, dev), lowest priority first for shedding
         running_pairs = []
@@ -763,7 +838,6 @@ class SolarSmartAsyncManager:
                     if stop_reason:
                         # Stop it and reclaim headroom
                         self._ensure_off(d, stop_reason)  # <- this must call self.plugin._execute_load_action(...)
-                        headroom_w += rated
                         running_now = max(0, running_now - 1)
                         action = "STOP"
                         status = "OFF"
@@ -788,9 +862,7 @@ class SolarSmartAsyncManager:
                         status = "OFF"
                     elif headroom_w >= needed_w:
                         # Start exactly ONE load per tick
-                        self._ensure_on(d,
-                                        "Start ok (threshold met)")  # <- ensure this calls self.plugin._execute_load_action(...)
-                        headroom_w -= rated
+                        self._ensure_on(d, "Start ok (threshold met)", headroom_snapshot=headroom_w)
                         starts_this_tick += 1
                         running_now += 1
                         action = "START"
@@ -974,6 +1046,8 @@ class SolarSmartAsyncManager:
         return (True, headroom_w - rated)  # approximate impact by rated watts
 
     # ---------- Shedding ----------
+
+
     # ---------- Shedding (one at a time) ----------
     def _shed_until_positive(self, headroom_w: int, running_by_tier: list[tuple[int, indigo.Device]]) -> int:
         """
@@ -1033,7 +1107,6 @@ class SolarSmartAsyncManager:
             )
 
         self._ensure_off(dev, "Emergency shed (headroom negative)")
-        headroom_w += rated
 
         if dbg:
             self.plugin.logger.debug(f"_shed_until_positive: new headroom={headroom_w}W after shedding {dev.name}")
@@ -1155,7 +1228,7 @@ class SolarSmartAsyncManager:
                 self.plugin.logger.debug(f"{dev.name}: quota window rolled over, counters reset")
 
     # ========== Actuation wrappers ==========
-    def _ensure_on(self, dev, reason: str):
+    def _ensure_on(self, dev, reason: str, headroom_snapshot: int | None = None):
         """Turn a load ON (if not already), set IsRunning immediately, and book-keep."""
         try:
             if self._is_running(dev):
@@ -1170,9 +1243,24 @@ class SolarSmartAsyncManager:
             st = self.plugin._load_state.setdefault(dev.id, {})
             st["start_ts"] = time.time()
             self._mark_running(dev, True)
-            dev.updateStateOnServer("IsRunning", True)
-            dev.updateStateOnServer("Status", "RUNNING")
             dev.updateStateOnServer("LastReason", reason)
+
+            # Build INFO line
+            props = dev.pluginProps or {}
+            tier = props.get("tier", "—")
+            try:
+                rated = int(float(props.get("ratedWatts", 0)) or 0)
+            except Exception:
+                rated = 0
+
+            pv, con, bat, hdrm_main, ts = self._snapshot_main_metrics()
+            hdrm = headroom_snapshot if headroom_snapshot is not None else hdrm_main
+
+            self.plugin.logger.info(
+                f"Starting '{dev.name}' (Tier {tier}, {self._fmt_w(rated)}). "
+                f"Headroom {self._fmt_w(hdrm)}; PV {self._fmt_w(pv)}, Load {self._fmt_w(con)}, "
+                f"Battery {self._fmt_w(bat)}. Reason: {reason}"
+            )
 
             if getattr(self.plugin, "debug2", False):
                 self.plugin.logger.debug(f"_ensure_on: {dev.name} → ON ({reason})")
@@ -1180,26 +1268,43 @@ class SolarSmartAsyncManager:
             self.plugin.logger.exception(f"_ensure_on: error while starting {dev.name}")
 
     def _ensure_off(self, dev, reason: str):
-        """Turn a running load OFF and bookkeeping."""
+        """Turn a running load OFF, clear flags, and always log INFO."""
         try:
-            if not self._is_running(dev):
-                # still write reason for visibility
+            was_running = self._is_running(dev)
+            if not was_running:
+                # Already off – just record reason and leave quietly
                 dev.updateStateOnServer("LastReason", reason)
+                if getattr(self.plugin, "debug2", False):
+                    self.plugin.logger.debug(f"_ensure_off: {dev.name} already OFF ({reason})")
                 return
 
-            # Call your existing ON/OFF executor (you added this earlier)
-            self.plugin._execute_load_action(dev, turn_on=False, reason=reason)
+            # Snapshot observed metrics BEFORE stopping
+            pv, con, bat, hdrm, ts = self._snapshot_main_metrics()
 
-            # Update internal state & device states
+            # Execute OFF and clear flags
             st = self.plugin._load_state.setdefault(dev.id, {})
-            st["start_ts"] = None
+            self.plugin._execute_load_action(dev, turn_on=False, reason=reason)
+            ran_secs = None
+            if st.get("start_ts"):
+                try:
+                    ran_secs = max(0, int(time.time() - st["start_ts"]))
+                except Exception:
+                    ran_secs = None
+
             self._mark_running(dev, False)
-            dev.updateStateOnServer("IsRunning", False)
-            dev.updateStateOnServer("Status", "OFF")
             dev.updateStateOnServer("LastReason", reason)
 
-            if getattr(self.plugin, "debug2", False):
-                self.plugin.logger.debug(f"_ensure_off: {dev.name} → OFF ({reason})")
+            # Always log OFF at INFO
+            ran_txt = ""
+            if ran_secs is not None:
+                m, s = divmod(ran_secs, 60)
+                ran_txt = f" after {m}m {s}s"
+            self.plugin.logger.info(
+                f"Stopping '{dev.name}'{ran_txt}. Reason: {reason}. "
+                f"Headroom {self._fmt_w(hdrm)}; PV {self._fmt_w(pv)}, "
+                f"Load {self._fmt_w(con)}, Battery {self._fmt_w(bat)}"
+            )
+
         except Exception:
             self.plugin.logger.exception(f"_ensure_off: error while stopping {dev.name}")
 
@@ -1222,6 +1327,14 @@ class Plugin(indigo.PluginBase):
         except:
             self.logLevel = logging.INFO
             self.fileloglevel = logging.DEBUG
+
+        raw = self.pluginPrefs.get("frequency_checks", 1)  # minutes
+        try:
+            self.time_for_checks_frequency = float(raw)
+        except Exception:
+            self.time_for_checks_frequency = 1.0  # default 1 minute
+        if self.time_for_checks_frequency <= 0:
+            self.time_for_checks_frequency = 1.0
 
         self.logger.removeHandler(self.indigo_log_handler)
         self.indigo_log_handler = IndigoLogHandler(pluginDisplayName, logging.INFO)

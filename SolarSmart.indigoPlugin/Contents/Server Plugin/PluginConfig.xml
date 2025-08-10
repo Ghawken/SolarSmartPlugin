@@ -12,10 +12,22 @@
    <Field id="infoLabel01" type="label" fontSize='large' fontColor="blue">
         <Label>This is the Smart Solar Main Solar Generation Plugin Config Device.
 
-            This plugin enables creation of device loads, and attempts to match solar output to load use
+This plugin enables creation of multiple device loads, and attempts to match solar output to load use
+Based on user selectable load criteria.
+Includes a Test Device for testing different solar conditions for the loads
+
         </Label>
     </Field>
-
+           <Field id="sep_hint_3" type="separator"/>
+      <Field id="frequency_checks" type="textfield" defaultValue="5">
+    <Label>Time (mins) for Checks:</Label>
+    <Description>Time for checking current production data</Description>
+  </Field>
+            <Field id="hint_2" type="label"  fontColor="blue" alwaysUseInDialogHeightCalc="true">
+        <Label>Time between checks of current Solar production, usage in minutes.
+Applies this data to devices running or otherwise as needed.
+Shorter time risks devices on and off, longer time misses Solar changes</Label>
+      </Field>
     <Field id="space10" type="label" alignText="right">
         <Label>Debugging Options:</Label>
     </Field>
@@ -43,9 +55,9 @@
         <Description>4. Debug Render Table</Description>
     </Field>
 
-    <Field id="debug5" type="checkbox" hidden="True"  tooltip="Enabling will .">
+    <Field id="debug5" type="checkbox" hidden="False"  tooltip="Enabling will .">
         <Label/>
-        <Description>5. Debug 5</Description>
+        <Description>5. Debug Async Solar Manager</Description>
     </Field>
 
     <Field id="debug6" type="checkbox" hidden="True" tooltip="Enabling will .">
