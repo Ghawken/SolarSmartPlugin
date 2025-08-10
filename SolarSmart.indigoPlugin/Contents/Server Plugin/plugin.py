@@ -1276,6 +1276,7 @@ class SolarSmartAsyncManager:
                 dev.updateStateOnServer("LastReason", reason)
                 if getattr(self.plugin, "debug2", False):
                     self.plugin.logger.debug(f"_ensure_off: {dev.name} already OFF ({reason})")
+                self.plugin._execute_load_action(dev, turn_on=False, reason=reason)
                 return
 
             # Snapshot observed metrics BEFORE stopping
