@@ -753,6 +753,8 @@ class SolarSmartAsyncManager:
             tiers[t].sort(key=lambda d: self._served_quota_mins(d))
         return dict(sorted(tiers.items(), key=lambda kv: kv[0]))  # lowest tier number first
 
+
+
     # ========== ON/OFF decisions per tier ==========
     def _should_stop(self, dev, props, headroom_w: int) -> str | None:
         """
@@ -1576,38 +1578,52 @@ class Plugin(indigo.PluginBase):
 
 
         return True
+#
+    def _external_on_state(self, load_dev: indigo.Device):
+        """
+        If this SmartSolar Load is controlled by a real Indigo device (not an action group),
+        return that device's on/off (True/False). Otherwise return None.
+        Expected props:
+          - controlMode: "device" or "actionGroup"
+          - controlDeviceId: int (if device mode)
+        """
+        try:
+            props = load_dev.pluginProps or {}
+            if (props.get("controlMode") or "").lower() != "device":
+                return None
+            did = int(props.get("controlDeviceId", 0) or 0)
+            if did and did in indigo.devices:
+                ext = indigo.devices[did]
+                # Prefer the shortcut property; falls back to state
+                try:
+                    return bool(ext.onState)
+                except Exception:
+                    return bool(ext.states.get("onOffState", False))
+            return None
+        except Exception:
+            return None
 
     def _hydrate_load_state_from_device(self, dev: indigo.Device):
-        """Rebuild internal _load_state for a load from its persisted device states."""
+        """Rebuild in-memory _load_state for a SmartSolar Load from its persisted device states.
+           If this load controls a real Indigo device (not an action group), mirror that device's
+           onOffState into IsRunning (no actions sent). Otherwise, do NOT resume running on restart.
+        """
         if dev.deviceTypeId != "solarsmartLoad":
             return
+
         st = self._load_state.setdefault(dev.id, {})
 
-        # Do NOT resume RUN on restart:
-        if dev.states.get("IsRunning", False):
-            dev.updateStateOnServer("IsRunning", False)
-            dev.updateStateOnServer("Status", "OFF")
-            dev.updateStateOnServer("LastReason", "Plugin restart recovery")
-
-        st["IsRunning"] = bool(dev.states.get("IsRunning", False))
-
         try:
-            # Read persisted counters
+            # --- Persisted counters / anchors ---
             st["served_quota_mins"] = int(dev.states.get("RuntimeQuotaMins", 0) or 0)
-            # Anchor & last start timestamps (strings -> floats or None)
+
             q_ts = dev.states.get("QuotaAnchorTs", "")
-            st["quota_anchor_ts"] = float(q_ts) if q_ts not in ("", None) else None
+            st["quota_anchor_ts"] = float(q_ts) if q_ts not in ("", None, "") else None
 
             s_ts = dev.states.get("LastStartTs", "")
-            st["start_ts"] = float(s_ts) if s_ts not in ("", None) else None
+            st["start_ts"] = float(s_ts) if s_ts not in ("", None, "") else None
 
-            # Safety: never resume as 'running' after a restart
-            if dev.states.get("IsRunning", False):
-                dev.updateStateOnServer("IsRunning", False)
-                dev.updateStateOnServer("Status", "OFF")
-                dev.updateStateOnServer("LastReason", "Plugin restart recovery")
-
-            # Make RemainingQuotaMins consistent with props & RuntimeQuotaMins
+            # Ensure RemainingQuotaMins matches props target
             props = dev.pluginProps or {}
             target = int(props.get("maxRuntimePerQuotaMins") or 0)
             remaining = max(0, target - st["served_quota_mins"]) if target > 0 else 0
@@ -1623,9 +1639,50 @@ class Plugin(indigo.PluginBase):
                 st["quota_anchor_ts"] = now_ts
                 dev.updateStateOnServer("QuotaAnchorTs", f"{now_ts:.3f}")
 
+            # --- Mirror external device on/off if available ---
+            # Expect props: controlMode = "device" / "actionGroup"; controlDeviceId when device mode
+            ext_on = None
+            try:
+                ctrl_mode = (props.get("controlMode") or "").lower()
+                if ctrl_mode == "device":
+                    ctrl_id = int(props.get("controlDeviceId", 0) or 0)
+                    if ctrl_id and ctrl_id in indigo.devices:
+                        ext = indigo.devices[ctrl_id]
+                        self.logger.debug(f"Startup Target Device Checking: {ext.name} {ext.onState=}")
+                        try:
+                            ext_on = bool(ext.onState)  # shortcut
+                        except Exception:
+                            ext_on = bool(ext.states.get("onOffState", False))
+            except Exception:
+                ext_on = None
+
+            if ext_on is not None:
+                # Reflect real device state; no actions here
+                st["IsRunning"] = bool(ext_on)
+                if ext_on:
+                    dev.updateStateOnServer("IsRunning", True)
+                    dev.updateStateOnServer("Status", "RUNNING")
+                    dev.updateStateOnServer("LastReason", "Hydrate from external onOffState")
+                else:
+                    dev.updateStateOnServer("IsRunning", False)
+                    dev.updateStateOnServer("Status", "OFF")
+                    dev.updateStateOnServer("LastReason", "Hydrate from external onOffState")
+            else:
+                # No external state to trust (e.g., action group control) — do NOT resume running
+                st["IsRunning"] = False
+                dev.updateStateOnServer("IsRunning", False)
+                dev.updateStateOnServer("Status", "OFF")
+                # Only set LastReason if empty to avoid clobbering recent info
+                if not dev.states.get("LastReason"):
+                    dev.updateStateOnServer("LastReason", "Plugin restart recovery")
+
             if getattr(self, "debug2", False):
-                self.logger.debug(f"Hydrated load {dev.name}: served={st['served_quota_mins']}m, "
-                                  f"anchor={st['quota_anchor_ts']}, start_ts={st.get('start_ts')}")
+                self.logger.debug(
+                    f"Hydrated {dev.name}: served={st['served_quota_mins']}m, "
+                    f"anchor={st['quota_anchor_ts']}, start_ts={st.get('start_ts')}, "
+                    f"IsRunning={st.get('IsRunning')} (ext_on={ext_on})"
+                )
+
         except Exception:
             self.logger.exception(f"Hydrate failed for {dev.name}")
 
