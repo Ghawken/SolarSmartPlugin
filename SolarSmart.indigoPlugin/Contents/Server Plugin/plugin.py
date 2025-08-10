@@ -353,7 +353,7 @@ class SolarSmartAsyncManager:
           • Tier medals (emoji) overlaid near the Tier cell
         Saves to self.plugin.saveDirectory/filename and returns the full path.
         """
-        dbg = getattr(self.plugin, "debug2", False)
+        dbg = getattr(self.plugin, "debug4", False)
         log = self.plugin.logger
 
         if dbg:
@@ -683,6 +683,35 @@ class SolarSmartAsyncManager:
         return dict(sorted(tiers.items(), key=lambda kv: kv[0]))  # lowest tier number first
 
     # ========== ON/OFF decisions per tier ==========
+    def _should_stop(self, dev, props, headroom_w: int) -> str | None:
+        """
+        Decide if a RUNNING load should STOP. Return reason if yes, else None.
+        Minimal criteria:
+          • Quota exhausted
+          • Headroom can’t sustain rated power (with small hysteresis)
+        """
+        # Quota
+        try:
+            remaining = int(self._quota_remaining_mins(dev, props, datetime.now()))
+        except Exception:
+            remaining = 0
+        if remaining <= 0:
+            return "Quota exhausted"
+
+        # Headroom sustain check (simple + tiny hysteresis)
+        try:
+            rated = int(float(props.get("ratedWatts", 0)) or 0)
+        except Exception:
+            rated = 0
+        hysteresis_w = int(props.get("shedHysteresisW", 100) or 100)  # default 100W cushion
+
+        # If removing this load's rated draw still leaves us NEGATIVE beyond hysteresis → stop it.
+        # i.e., (headroom - rated) < -hysteresis
+        if (headroom_w - rated) < (0 - hysteresis_w):
+            return f"Headroom low (need {rated}W, have {headroom_w}W)"
+
+        return None
+
     def _schedule_by_tier(self, loads_by_tier: dict[int, list[indigo.Device]], headroom_w: int):
         dbg = getattr(self.plugin, "debug2", False)
         max_concurrent = self._get_max_concurrent_loads()
@@ -729,28 +758,48 @@ class SolarSmartAsyncManager:
                 before_headroom = headroom_w
 
                 if self._is_running(d):
-                    # KEEP/STOP decision (your existing logic)
-                    headroom_w = self._evaluate_keep(d, headroom_w)
-                    action = "KEEP"
+                    # Decide KEEP vs STOP
+                    stop_reason = self._should_stop(d, props, headroom_w)
+                    if stop_reason:
+                        # Stop it and reclaim headroom
+                        self._ensure_off(d, stop_reason)  # <- this must call self.plugin._execute_load_action(...)
+                        headroom_w += rated
+                        running_now = max(0, running_now - 1)
+                        action = "STOP"
+                        status = "OFF"
+                        if dbg:
+                            self.plugin.logger.debug(f"[STOP] {d.name}: {stop_reason} → headroom now {headroom_w}W")
+                    else:
+                        action = "KEEP"
+                        status = "RUN"
                 else:
                     # start constraints
                     if starts_this_tick >= 1:
                         action = "SKIP (cap)"
+                        status = "OFF"
                     elif running_now >= max_concurrent:
                         action = "SKIP (conc)"
+                        status = "OFF"
                     elif remaining <= 0:
                         action = "SKIP (quota)"
+                        status = "OFF"
                     elif not self._cooldown_met(d, int(props.get("cooldownMins") or 0)):
                         action = "SKIP (cooldn)"
+                        status = "OFF"
                     elif headroom_w >= needed_w:
                         # Start exactly ONE load per tick
-                        self._ensure_on(d, "Start ok (threshold met)")
+                        self._ensure_on(d,
+                                        "Start ok (threshold met)")  # <- ensure this calls self.plugin._execute_load_action(...)
                         headroom_w -= rated
                         starts_this_tick += 1
                         running_now += 1
                         action = "START"
+                        status = "RUN"
+                        if dbg:
+                            self.plugin.logger.debug(f"[START] {d.name}: rated={rated}W → headroom now {headroom_w}W")
                     else:
                         action = "SKIP (headrm)"
+                        status = "OFF"
 
                 # (if you still build the table, append row here)
                 table_rows.append((tier, d.name, rated, status, remaining, before_headroom, needed_w, action))
@@ -993,17 +1042,24 @@ class SolarSmartAsyncManager:
 
     # ========== Runtime/Quota/Cooldown state tracking ==========
     def _is_running(self, dev: indigo.Device) -> bool:
-        return bool(self.plugin._load_state.get(dev.id, {}).get("running", False))
+        # Device state is the source of truth
+        try:
+            return bool(dev.states.get("IsRunning", False))
+        except Exception:
+            return bool(self.plugin._load_state.get(dev.id, {}).get("IsRunning", False))
 
     def _mark_running(self, dev: indigo.Device, running: bool):
         st = self.plugin._load_state.setdefault(dev.id, {})
         if running:
-            st["start_ts"] = time.time()
-            dev.updateStateOnServer("LastStartTs", f"{st['start_ts']:.3f}")
+            now = time.time()
+            st["start_ts"] = now
+            st["IsRunning"] = True  # mirror
+            dev.updateStateOnServer("LastStartTs", f"{now:.3f}")
             dev.updateStateOnServer("IsRunning", True)
             dev.updateStateOnServer("Status", "RUNNING")
         else:
             st["start_ts"] = None
+            st["IsRunning"] = False  # mirror
             dev.updateStateOnServer("LastStartTs", "")
             dev.updateStateOnServer("IsRunning", False)
             dev.updateStateOnServer("Status", "OFF")
@@ -1099,16 +1155,29 @@ class SolarSmartAsyncManager:
                 self.plugin.logger.debug(f"{dev.name}: quota window rolled over, counters reset")
 
     # ========== Actuation wrappers ==========
-    def _ensure_on(self, dev: indigo.Device, reason: str):
-        if self._is_running(dev):
-            return
-        self.plugin._execute_load_action(dev, turn_on=True, reason=reason)
-        self._mark_running(dev, True)
-        dev.updateStateOnServer("IsRunning", True)
-        dev.updateStateOnServer("StartedAt", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        dev.updateStateOnServer("LastReason", reason)
-        # start accruing runtime per tick in a separate tally
-        # (here we’ll add minutes on each scheduler pass if still running)
+    def _ensure_on(self, dev, reason: str):
+        """Turn a load ON (if not already), set IsRunning immediately, and book-keep."""
+        try:
+            if self._is_running(dev):
+                # already marked running; just update reason for visibility
+                dev.updateStateOnServer("LastReason", reason)
+                return
+
+            # fire the action group
+            self.plugin._execute_load_action(dev, turn_on=True, reason=reason)
+
+            # mark running NOW (don’t wait for external device feedback)
+            st = self.plugin._load_state.setdefault(dev.id, {})
+            st["start_ts"] = time.time()
+            self._mark_running(dev, True)
+            dev.updateStateOnServer("IsRunning", True)
+            dev.updateStateOnServer("Status", "RUNNING")
+            dev.updateStateOnServer("LastReason", reason)
+
+            if getattr(self.plugin, "debug2", False):
+                self.plugin.logger.debug(f"_ensure_on: {dev.name} → ON ({reason})")
+        except Exception:
+            self.plugin.logger.exception(f"_ensure_on: error while starting {dev.name}")
 
     def _ensure_off(self, dev, reason: str):
         """Turn a running load OFF and bookkeeping."""
@@ -1119,11 +1188,12 @@ class SolarSmartAsyncManager:
                 return
 
             # Call your existing ON/OFF executor (you added this earlier)
-            self._execute_load_action(dev, turn_on=False, reason=reason)
+            self.plugin._execute_load_action(dev, turn_on=False, reason=reason)
 
             # Update internal state & device states
             st = self.plugin._load_state.setdefault(dev.id, {})
             st["start_ts"] = None
+            self._mark_running(dev, False)
             dev.updateStateOnServer("IsRunning", False)
             dev.updateStateOnServer("Status", "OFF")
             dev.updateStateOnServer("LastReason", reason)
@@ -1217,6 +1287,52 @@ class Plugin(indigo.PluginBase):
         pv_w = self.read_pv_watts(props)  # required
         cons_w = self.read_consumption_watts(props)  # optional
         batt_w = self.read_battery_watts(props)  # optional
+
+        # --- Override with SolarSmart Test Source if present/enabled ---
+        try:
+            test_dev = next((d for d in indigo.devices
+                             if d.deviceTypeId == "solarsmartTest" and d.enabled), None)
+        except Exception:
+            test_dev = None
+
+        if test_dev:
+            tprops = test_dev.pluginProps or {}
+
+            def _pint(val, default=None):
+                try:
+                    s = (val or "").strip()
+                    if s == "" and default is not None:
+                        return default
+                    return int(float(s))
+                except Exception:
+                    return default
+
+            pv_override = _pint(tprops.get("pvTestW"), 0)  # default to 0 if blank
+            cons_override = _pint(tprops.get("consTestW"), None)  # optional
+            batt_override = _pint(tprops.get("battTestW"), None)  # optional (neg = discharge)
+
+            pv_w = pv_override
+            cons_w = cons_override if cons_override is not None else cons_w
+            batt_w = batt_override if batt_override is not None else batt_w
+
+            # Optional: mirror props to Test device states for Control Page use
+            try:
+                test_dev.updateStateOnServer("SolarTestW", pv_override)
+                if cons_override is not None:
+                    test_dev.updateStateOnServer("ConsumptionTestW", cons_override)
+                if batt_override is not None:
+                    test_dev.updateStateOnServer("BatteryTestW", batt_override)
+                test_dev.updateStateOnServer("Status", "OVERRIDING SolarSmart Main")
+                test_dev.updateStateOnServer("LastUpdate", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            except Exception:
+                pass
+
+            # Informative log (once per tick)
+            self.logger.info(
+                f"Over-riding Solar Data with SolarSmart Test device '{test_dev.name}': PV={pv_w} W,"
+                f" Cons={'None' if cons_w is None else cons_w} W,"
+                f" Batt={'None' if batt_w is None else batt_w} W"
+            )
 
         if getattr(self, "debug2", False):
             self.logger.debug(f"_update_solarsmart_states: raw PV={pv_w}, Cons={cons_w}, Batt={batt_w}")
@@ -1352,6 +1468,15 @@ class Plugin(indigo.PluginBase):
         if dev.deviceTypeId != "solarsmartLoad":
             return
         st = self._load_state.setdefault(dev.id, {})
+
+        # Do NOT resume RUN on restart:
+        if dev.states.get("IsRunning", False):
+            dev.updateStateOnServer("IsRunning", False)
+            dev.updateStateOnServer("Status", "OFF")
+            dev.updateStateOnServer("LastReason", "Plugin restart recovery")
+
+        st["IsRunning"] = bool(dev.states.get("IsRunning", False))
+
         try:
             # Read persisted counters
             st["served_quota_mins"] = int(dev.states.get("RuntimeQuotaMins", 0) or 0)

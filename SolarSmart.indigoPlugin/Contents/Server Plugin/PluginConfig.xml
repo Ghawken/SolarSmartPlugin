@@ -38,9 +38,9 @@
         <Description>3. Debug Menu Action Device Selections (verbose)</Description>
     </Field>
 
-    <Field id="debug4" type="checkbox" hidden="True" tooltip="Enabling will result .">
+    <Field id="debug4" type="checkbox" hidden="False" tooltip="Enabling will result .">
         <Label/>
-        <Description>4. Debug4</Description>
+        <Description>4. Debug Render Table</Description>
     </Field>
 
     <Field id="debug5" type="checkbox" hidden="True"  tooltip="Enabling will .">

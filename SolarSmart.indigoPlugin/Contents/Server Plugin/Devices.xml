@@ -371,6 +371,63 @@
   </States>
 </Device>
 
+  <Device type="custom" id="solarsmartTest">
+    <Name>SolarSmart Test Source</Name>
+
+    <ConfigUI>
+      <Field id="warn" type="label" fontColor="orange" fontSize="medium" alwaysUseInDialogHeightCalc="true">
+        <Label>
+This Test device will OVERRIDE the SolarSmart Main readings (PV, Consumption, Battery)
+for testing purposes only. Disable or delete this device when finished.
+        </Label>
+      </Field>
+
+      <Field id="pvTestW" type="textfield" defaultValue="0">
+        <Label>Test Solar Production (W):</Label>
+        <Description>Integer Watts (e.g., 4200)</Description>
+      </Field>
+
+      <Field id="consTestW" type="textfield" defaultValue="">
+        <Label>Test Site Consumption (W):</Label>
+        <Description>Integer Watts (optional, leave blank to omit)</Description>
+      </Field>
+
+      <Field id="battTestW" type="textfield" defaultValue="">
+        <Label>Test Battery Power (W):</Label>
+        <Description>Positive = charging, Negative = discharging (optional)</Description>
+      </Field>
+    </ConfigUI>
+
+    <UiDisplayStateId>Status</UiDisplayStateId>
+        <States>
+      <State id="Status">
+        <ValueType>String</ValueType>
+         <TriggerLabel>Test Device Status</TriggerLabel>
+    <ControlPageLabel>Test Device Status</ControlPageLabel>
+      </State>
+      <State id="SolarTestW">
+        <ValueType>Integer</ValueType>
+            <TriggerLabel>SolarTestW</TriggerLabel>
+    <ControlPageLabel>SolarTestW</ControlPageLabel>
+      </State>
+      <State id="ConsumptionTestW">
+        <ValueType>Integer</ValueType>
+            <TriggerLabel>ConsumptionTestW</TriggerLabel>
+    <ControlPageLabel>ConsumptionTestW</ControlPageLabel>
+      </State>
+      <State id="BatteryTestW">
+        <ValueType>Integer</ValueType>
+            <TriggerLabel>BatteryTestW</TriggerLabel>
+    <ControlPageLabel>BatteryTestW</ControlPageLabel>
+      </State>
+      <State id="LastUpdate">
+        <ValueType>String</ValueType>
+            <TriggerLabel>Last update (epoch)</TriggerLabel>
+    <ControlPageLabel>Last update (epoch)</ControlPageLabel>
+      </State>
+    </States>
+  </Device>
+
 
 
 </Devices>
