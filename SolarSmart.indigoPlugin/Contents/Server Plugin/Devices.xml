@@ -44,7 +44,27 @@
         <Label>Consumption State:</Label>
         <List class="self" method="consumption_state_list" dynamicReload="true"/>
       </Field>
+      <!-- ===== Grid Power (optional) ===== -->
+      <Field id="grid_batt" type="separator"/>
 
+      <Field id="useGridHeadroom" type="checkbox" tooltip="Enabling will use Grid information as Net everything.">
+        <Label>Use Grid Data Only:</Label>
+        <Description> Use Grid usage + / - as only factor in load</Description>
+    </Field>
+      <Field id="gridHeader" type="label" fontColor="black" fontSize="medium">
+        <Label>Grid Power (Watts; + = charging, − = discharging)</Label>
+      </Field>
+
+      <Field id="gridDeviceId" type="menu" defaultValue="">
+        <Label>Grid Device:</Label>
+        <List class="self" method="grid_device_list" dynamicReload="true"/>
+        <CallbackMethod>grid_device_changed</CallbackMethod>
+      </Field>
+
+      <Field id="gridStateId" type="menu" defaultValue="">
+        <Label>Grid State:</Label>
+        <List class="self" method="grid_state_list" dynamicReload="true"/>
+       </Field>
       <!-- ===== Battery Power (optional) ===== -->
       <Field id="sep_batt" type="separator"/>
       <Field id="battHeader" type="label" fontColor="black" fontSize="medium">
@@ -61,6 +81,7 @@
         <Label>Battery State:</Label>
         <List class="self" method="battery_state_list" dynamicReload="true"/>
       </Field>
+
  <Field id="sep_hint_2" type="separator"/>
         <Field id="maxConcurrentLoads" type="textfield" defaultValue="2">
     <Label>Max Concurrent Loads</Label>
@@ -98,6 +119,11 @@
         <ControlPageLabel>Battery power (W)</ControlPageLabel>
       </State>
 
+      <State id="GridPower">
+        <ValueType>Integer</ValueType>
+        <TriggerLabel>Grid power</TriggerLabel>
+        <ControlPageLabel>Grid power (W)</ControlPageLabel>
+      </State>
       <!-- Optional computed helper, populated by the plugin -->
       <State id="Headroom">
         <ValueType>Integer</ValueType>
@@ -395,6 +421,16 @@ for testing purposes only. Disable or delete this device when finished.
         <Label>Test Battery Power (W):</Label>
         <Description>Positive = charging, Negative = discharging (optional)</Description>
       </Field>
+
+      <Field id="useGridHeadroom" type="checkbox" tooltip="Enabling will use Grid information as Net everything.">
+        <Label>Use Grid Data Only:</Label>
+        <Description> Use Grid usage + / - as only factor in load decisions</Description>
+    </Field>
+      <Field id="gridTestW" type="textfield" defaultValue="">
+        <Label>Grid Battery Power (W):</Label>
+        <Description>Positive = importing power, Negative = exporting power</Description>
+      </Field>
+
     </ConfigUI>
 
     <UiDisplayStateId>Status</UiDisplayStateId>
@@ -408,6 +444,11 @@ for testing purposes only. Disable or delete this device when finished.
         <ValueType>Integer</ValueType>
             <TriggerLabel>SolarTestW</TriggerLabel>
     <ControlPageLabel>SolarTestW</ControlPageLabel>
+      </State>
+                <State id="GridTestW">
+        <ValueType>Integer</ValueType>
+            <TriggerLabel>GridTestW</TriggerLabel>
+    <ControlPageLabel>GridTestW</ControlPageLabel>
       </State>
       <State id="ConsumptionTestW">
         <ValueType>Integer</ValueType>

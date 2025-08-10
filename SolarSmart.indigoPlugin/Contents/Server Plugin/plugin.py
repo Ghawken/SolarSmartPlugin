@@ -742,6 +742,67 @@ class SolarSmartAsyncManager:
 
         return None
 
+    def _quota_window_minutes(self, props) -> int:
+        """Map the device's window selection to minutes. Defaults to 24h."""
+        # Expect props like: quotaWindow = "12h"|"24h"|"48h"|"72h"
+        key = (props.get("quotaWindow") or "24h").lower()
+        return {
+            "12h": 12 * 60,
+            "24h": 24 * 60,
+            "48h": 48 * 60,
+            "72h": 72 * 60,
+        }.get(key, 24 * 60)
+
+    def _maybe_rollover_quota(self, dev: indigo.Device, props: dict, now_ts: float = None):
+        """
+        If the configured quota window has elapsed since QuotaAnchorTs,
+        reset RuntimeQuotaMins to 0 and advance the anchor by whole windows.
+        Updates RemainingQuotaMins from maxRuntimePerQuotaMins.
+        """
+        try:
+            now_ts = now_ts or time.time()
+            st = self.plugin._load_state.setdefault(dev.id, {})
+            # Ensure we have an anchor (hydrate should have done this, but be safe)
+            anchor = st.get("quota_anchor_ts")
+            if anchor is None:
+                anchor = now_ts
+                st["quota_anchor_ts"] = anchor
+                dev.updateStateOnServer("QuotaAnchorTs", f"{anchor:.3f}")
+
+            window_min = self._quota_window_minutes(props)
+            if window_min <= 0:
+                return
+
+            elapsed_min = int((now_ts - anchor) // 60)
+            if elapsed_min < window_min:
+                return  # still inside the current window
+
+            # One or more full windows have elapsed
+            n_windows = elapsed_min // window_min
+            advance_sec = n_windows * window_min * 60
+            new_anchor = anchor + advance_sec
+
+            # Reset served quota to 0 for the new window
+            st["served_quota_mins"] = 0
+            dev.updateStateOnServer("RuntimeQuotaMins", 0)
+
+            # Recompute remaining from device props
+            target = int(props.get("maxRuntimePerQuotaMins") or 0)
+            remaining = max(0, target)
+            dev.updateStateOnServer("RemainingQuotaMins", remaining)
+
+            # Advance anchor
+            st["quota_anchor_ts"] = new_anchor
+            dev.updateStateOnServer("QuotaAnchorTs", f"{new_anchor:.3f}")
+
+            # Friendly log
+            self.plugin.logger.info(
+                f"Quota window reset for '{dev.name}': advanced {n_windows} window(s) of {window_min} min; "
+                f"RemainingQuotaMins set to {remaining}."
+            )
+        except Exception:
+            self.plugin.logger.exception(f"_maybe_rollover_quota: error on {dev.name}")
+
     # ========== Gather loads ==========
     def _collect_eligible_loads(self) -> dict[int, list[indigo.Device]]:
         """
@@ -820,6 +881,13 @@ class SolarSmartAsyncManager:
         starts_this_tick = 0
 
         table_rows = []  # for final summary table
+
+        # Rollover quota windows if needed (minimal change: just call it)
+        now_ts = time.time()
+        for _, devs in loads_by_tier.items():
+            for d in devs:
+                props = d.pluginProps or {}
+                self._maybe_rollover_quota(d, props, now_ts)
 
         pv, con, bat, hdrm, ts = self._snapshot_main_metrics()
         headroom_w = hdrm if hdrm is not None else 0
@@ -1387,8 +1455,11 @@ class Plugin(indigo.PluginBase):
         self.logger.info("{0:<30} {1}".format("Plugin ID:", pluginId))
         self.logger.info("{0:<30} {1}".format("Indigo version:", indigo.server.version))
         self.logger.info("{0:<30} {1}".format("Silicon version:", str(platform.machine())))
+        self.logger.info("{0:<30} {1}".format("Python version:", sys.version.replace('\n', '')))
+        self.logger.info("{0:<30} {1}".format("Python Directory:", sys.prefix.replace('\n', '')))
 
-        self.logger.info(u"{0:=^130}".format(""))
+        self._log_effective_source_summary()
+        #self.logger.info(u"{0:=^130}".format(""))
 
         self.triggers = {}
         # Internal in-memory map: { device.id: { state data } }
@@ -1427,11 +1498,14 @@ class Plugin(indigo.PluginBase):
         computes Headroom best-effort, and publishes to the SolarSmart device states.
         """
         props = dev.pluginProps or {}
-
+        dbg2 = getattr(self, "debug2", False)
         # --- Read numeric values ---
         pv_w = self.read_pv_watts(props)  # required
         cons_w = self.read_consumption_watts(props)  # optional
         batt_w = self.read_battery_watts(props)  # optional
+        # Defaults for grid logic (may be overridden by Test device)
+        use_grid_headroom = bool(props.get("useGridHeadroom", False))
+        grid_w = None
 
         # --- Override with SolarSmart Test Source if present/enabled ---
         try:
@@ -1455,6 +1529,9 @@ class Plugin(indigo.PluginBase):
             pv_override = _pint(tprops.get("pvTestW"), 0)  # default to 0 if blank
             cons_override = _pint(tprops.get("consTestW"), None)  # optional
             batt_override = _pint(tprops.get("battTestW"), None)  # optional (neg = discharge)
+            # NEW: grid override from Test device
+            test_use_grid = bool(tprops.get("useGridHeadroom", False))
+            grid_test_w = _pint(tprops.get("gridTestW"), None)  # optional
 
             pv_w = pv_override
             cons_w = cons_override if cons_override is not None else cons_w
@@ -1467,20 +1544,42 @@ class Plugin(indigo.PluginBase):
                     test_dev.updateStateOnServer("ConsumptionTestW", cons_override)
                 if batt_override is not None:
                     test_dev.updateStateOnServer("BatteryTestW", batt_override)
+                if grid_test_w is not None:
+                    test_dev.updateStateOnServer("GridTestW", grid_test_w)
                 test_dev.updateStateOnServer("Status", "OVERRIDING SolarSmart Main")
                 test_dev.updateStateOnServer("LastUpdate", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             except Exception:
                 pass
 
             # Informative log (once per tick)
-            self.logger.info(
-                f"Over-riding Solar Data with SolarSmart Test device '{test_dev.name}': PV={pv_w} W,"
-                f" Cons={'None' if cons_w is None else cons_w} W,"
-                f" Batt={'None' if batt_w is None else batt_w} W"
-            )
+            # If Test device requests grid-only and provides a value, USE IT
+            if test_use_grid and (grid_test_w is not None):
+                use_grid_headroom = True
+                grid_w = grid_test_w
+                self.logger.info(
+                    f"Over-riding Solar Data with SolarSmart Test device '{test_dev.name}': "
+                    f"Grid={grid_w} W (grid-only mode), PV={pv_w} W, "
+                    f"Cons={'None' if cons_w is None else cons_w} W, "
+                    f"Batt={'None' if batt_w is None else batt_w} W"
+                )
+            else:
+                # Regular test log (no grid-only)
+                self.logger.info(
+                    f"Over-riding Solar Data with SolarSmart Test device '{test_dev.name}': PV={pv_w} W, "
+                    f"Cons={'None' if cons_w is None else cons_w} W, "
+                    f"Batt={'None' if batt_w is None else batt_w} W"
+                )
 
         if getattr(self, "debug2", False):
             self.logger.debug(f"_update_solarsmart_states: raw PV={pv_w}, Cons={cons_w}, Batt={batt_w}")
+
+        if grid_w is None and use_grid_headroom:
+            # you likely already have this helper; if not, add the one I sent earlier
+            grid_w = self.read_grid_watts(props)
+
+        if dbg2:
+            self.logger.debug(f"_update_solarsmart_states: useGridHeadroom={use_grid_headroom}, Grid={grid_w}, "
+                              f"PV={pv_w}, Cons={cons_w}, Batt={batt_w}")
 
         # --- Publish required + optional states ---
         # If PV is missing (misconfig), publish 0 so UI isn’t blank and log it.
@@ -1492,10 +1591,19 @@ class Plugin(indigo.PluginBase):
         # Best-effort headroom (if consumption known). If batt_w is positive (charging), subtract it
         # from headroom as it already consumes PV/export capacity. If negative (discharging), it adds headroom.
         headroom = None
-        if cons_w is not None:
-            headroom = pv_w - cons_w
-            if batt_w is not None:
-                headroom -= max(batt_w, 0.0)  # subtract only charging power; negative (discharge) increases margin
+
+        if use_grid_headroom and (grid_w is not None):
+            # Import positive → deficit → negative headroom; Export negative → positive headroom
+            headroom = -grid_w
+            # Optional info once per tick to make mode obvious
+            if dbg2:
+                self.logger.debug(f"_update_solarsmart_states: using GRID for headroom => {headroom} W")
+        else:
+            if cons_w is not None:
+                headroom = pv_w - cons_w
+                if batt_w is not None:
+                    # Subtract only charging power (positive); negative (discharge) increases margin
+                    headroom -= max(batt_w, 0.0)
 
         # --- Push to server (Integers for W states) ---
         try:
@@ -1517,6 +1625,13 @@ class Plugin(indigo.PluginBase):
             except Exception as e:
                 if getattr(self, "debug2", False):
                     self.logger.debug(f"Failed updating BatteryPower: {e}")
+        # NEW: publish GridPower if present
+        if grid_w is not None:
+            try:
+                dev.updateStateOnServer("GridPower", int(grid_w))
+            except Exception as e:
+                if dbg2:
+                    self.logger.debug(f"Failed updating GridPower: {e}")
 
         if headroom is not None:
             try:
@@ -1548,22 +1663,171 @@ class Plugin(indigo.PluginBase):
         except Exception:
             return False
 
+    def _is_valid_device_choice(self, v) -> bool:
+        """Valid if it's a positive int-like value (device id)."""
+        try:
+            return int(str(v).strip()) > 0
+        except Exception:
+            return False
+
+    def _is_valid_state_choice(self, v) -> bool:
+        """Valid if it's a non-empty string not equal to '-1' (state id)."""
+        s = "" if v is None else str(v).strip()
+        return s != "" and s != "-1"
+
+
     def __del__(self):
         if self.debugLevel >= 2:
             self.debugLog(u"__del__ method called.")
         indigo.PluginBase.__del__(self)
 
+    def _pint(self, val, default=None):
+        try:
+            s = (val or "").strip()
+            if s == "" and default is not None:
+                return default
+            return int(round(float(s)))
+        except Exception:
+            return default
+
+    def _pint(self, val, default=None):
+        try:
+            s = (val or "").strip()
+            if s == "" and default is not None:
+                return default
+            return int(round(float(s)))
+        except Exception:
+            return default
+
+    def _log_effective_source_summary(self):
+        """
+        Log a plain-English summary for whichever source will be used:
+        - Test device (if enabled), else
+        - Main device
+        Includes current readings and the computed headroom.
+        """
+        # Prefer enabled Test device
+        test_dev = next((d for d in indigo.devices
+                         if d.deviceTypeId == "solarsmartTest" and d.enabled), None)
+        if test_dev:
+            tprops = test_dev.pluginProps or {}
+            use_grid = bool(tprops.get("useGridHeadroom", False))
+
+            pv_w = self._pint(tprops.get("pvTestW"), 0)
+            cons_w = self._pint(tprops.get("consTestW"), None)
+            batt_w = self._pint(tprops.get("battTestW"), None)
+            grid_w = self._pint(tprops.get("gridTestW"), None) if use_grid else None
+
+            # Compute headroom
+            headroom = None
+            if use_grid and grid_w is not None:
+                headroom = -grid_w
+            else:
+                if cons_w is not None:
+                    batt_adj = max(0, batt_w) if batt_w is not None else 0
+                    headroom = pv_w - cons_w - batt_adj
+
+            # Log banner
+            self.logger.info(u"{0:=^130}".format(""))
+            self.logger.info("🔌🔌 SolarSmart Setup 🔌🔌 (Test Override Active.  Main Device ignored.)")
+            self.logger.info("")
+            if use_grid and grid_w is not None:
+                flow_desc = "⚡ Importing from grid" if grid_w > 0 else (
+                    "🔋 Exporting to grid" if grid_w < 0 else "➖ Balanced (no net flow)")
+                self.logger.info("Mode: GRID-only — Net grid power will be the ONLY factor in headroom calculations.")
+                self.logger.info("This means PV, battery, and site consumption values are ignored.")
+                self.logger.info(f"Current grid reading: {grid_w} W → {flow_desc}")
+            else:
+                self.logger.info("Mode: PV/Consumption/Battery — Headroom is calculated from:")
+                self.logger.info("PV Production − Site Consumption − Battery Charging (if charging)")
+                pv_txt = f"{pv_w} W" if pv_w is not None else "unknown"
+                cons_txt = f"{cons_w} W" if cons_w is not None else "unknown"
+                batt_txt = f"{batt_w} W" if batt_w is not None else "none"
+                self.logger.info(f"Current PV: {pv_txt}, Consumption: {cons_txt}, Battery: {batt_txt}")
+
+            if headroom is not None:
+                if headroom > 0:
+                    self.logger.info(f"Positive headroom of {headroom} W — loads may be allowed to start.")
+                elif headroom < 0:
+                    self.logger.info(f"Negative headroom of {headroom} W — loads may need to stop.")
+                else:
+                    self.logger.info("Zero headroom — no spare power available for loads.")
+            self.logger.info("")
+            self.logger.info(u"{0:=^130}".format(""))
+            return  # done
+
+        # Otherwise, log Main device config if present
+        main = next((d for d in indigo.devices
+                     if d.deviceTypeId == "solarsmartMain" and d.enabled), None)
+        if not main:
+            return
+
+        props = main.pluginProps or {}
+        use_grid = bool(props.get("useGridHeadroom", False))
+
+        # Pull readings using your existing readers that accept props
+        grid_w = None
+        if use_grid and hasattr(self, "read_grid_watts"):
+            try:
+                grid_w = self.read_grid_watts(props)
+            except Exception:
+                grid_w = None
+
+        pv_w = self.read_pv_watts(props)
+        cons_w = self.read_consumption_watts(props)
+        batt_w = self.read_battery_watts(props)
+
+        headroom = None
+        if use_grid and grid_w is not None:
+            headroom = -int(grid_w)
+        else:
+            if pv_w is None:
+                pv_w = 0
+            if cons_w is not None:
+                batt_adj = max(0.0, float(batt_w)) if batt_w is not None else 0
+                headroom = int(round(pv_w - cons_w - batt_adj))
+
+        # Log banner
+        self.logger.info(u"{0:=^130}".format(""))
+        self.logger.info("🔌🔌 SolarSmart Setup 🔌🔌")
+        self.logger.info("")
+        if use_grid and grid_w is not None:
+            flow_desc = "⚡ Importing from grid" if grid_w > 0 else (
+                "🔋 Exporting to grid" if grid_w < 0 else "➖ Balanced (no net flow)")
+            self.logger.info("Mode: Net Grid mode only — Net grid power will be the only factor in headroom calculations.")
+            self.logger.info("(This is likely the most accurate, if your Meters support it)")
+            self.logger.info("This means PV, battery, and site consumption values are reported but ignored.")
+            self.logger.info(f"Current grid reading: {grid_w} W → {flow_desc}")
+        else:
+            self.logger.info("Mode: PV/Consumption/Battery — Headroom is calculated from:")
+            self.logger.info("PV Production − Site Consumption − Battery Charging (if charging)")
+            pv_txt = f"{int(pv_w)} W" if pv_w is not None else "unknown"
+            cons_txt = f"{int(cons_w)} W" if cons_w is not None else "unknown"
+            batt_txt = f"{int(float(batt_w))} W" if batt_w is not None else "none"
+            self.logger.info(f"Current PV: {pv_txt}, Consumption: {cons_txt}, Battery: {batt_txt}")
+
+        if headroom is not None:
+            if headroom > 0:
+                self.logger.info(f"Positive headroom of {headroom} W — loads may be allowed to start.")
+            elif headroom < 0:
+                self.logger.info(f"Negative headroom of {headroom} W — loads may need to stop.")
+            else:
+                self.logger.info("Zero headroom — no spare power available for loads.")
+        self.logger.info("")
+        self.logger.info(u"{0:=^130}".format(""))
+
     def closedDeviceConfigUi(self, valuesDict, userCancelled, typeId, devId):
-        """
-        Called after the Configure Device dialog closes.
-        We refresh the states immediately (if not cancelled).
-        """
-        if typeId != "solarsmartMain":
+        # Handle Test device logging too
+        if typeId == "solarsmartTest":
+            try:
+                dev = indigo.devices[devId]
+            except Exception:
+                return valuesDict
+            # Always show what will be used effectively
+            self._log_effective_source_summary()
             return valuesDict
 
-        if userCancelled:
-            if getattr(self, "debug2", False):
-                self.logger.debug(f"closedDeviceConfigUi: cancelled for device #{devId}")
+        if typeId != "solarsmartMain":
             return valuesDict
 
         try:
@@ -1571,11 +1835,15 @@ class Plugin(indigo.PluginBase):
         except Exception:
             return valuesDict
 
-        if getattr(self, "debug2", False):
-            self.logger.debug(f"closedDeviceConfigUi: applying immediate update for SolarSmart Main #{devId}")
+        # Always show what will be used effectively
+        self._log_effective_source_summary()
 
-        # One-shot refresh using the (now saved) props
-        self._update_solarsmart_states(dev)
+        # Refresh states immediately if not cancelled
+        if not userCancelled:
+            if getattr(self, "debug2", False):
+                self.logger.debug(f"closedDeviceConfigUi: applying immediate update for SolarSmart Main #{devId}")
+            self._update_solarsmart_states(dev)
+
         return valuesDict
 
     def closedPrefsConfigUi(self, valuesDict, userCancelled):
@@ -1808,17 +2076,33 @@ class Plugin(indigo.PluginBase):
         Extend your existing validate for solarsmartMain; validate solarsmartLoad here.
         """
         if typeId == "solarsmartMain":
-            # Keep your existing main validation here (PV device/state required)
-            pv_dev_ok = _is_valid_choice(valuesDict.get("pvDeviceId"))
-            pv_st_ok = bool(valuesDict.get("pvStateId") not in (None, "", "-1"))
-            if not pv_dev_ok or not pv_st_ok:
+            self.logger.debug(f"{valuesDict=}")
+            use_grid = bool(valuesDict.get("useGridHeadroom", False))
+
+            if use_grid:
+                grid_dev_ok = self._is_valid_device_choice(valuesDict.get("gridDeviceId", ""))
+                grid_st_ok = self._is_valid_state_choice(valuesDict.get("gridStateId", ""))
+                if grid_dev_ok and grid_st_ok:
+                    return (True, valuesDict)
                 errorDict = indigo.Dict()
-                if not pv_dev_ok:
-                    errorDict["pvDeviceId"] = "Select a PV device."
-                if not pv_st_ok:
-                    errorDict["pvStateId"] = "Select the PV state."
+                if not grid_dev_ok:
+                    errorDict["gridDeviceId"] = "Select the Grid device."
+                if not grid_st_ok:
+                    errorDict["gridStateId"] = "Select the Grid state."
                 return (False, valuesDict, errorDict)
-            return (True, valuesDict)
+
+            # Not using grid-only -> PV is required
+            pv_dev_ok = self._is_valid_device_choice(valuesDict.get("pvDeviceId", ""))
+            pv_st_ok = self._is_valid_state_choice(valuesDict.get("pvStateId", ""))
+            if pv_dev_ok and pv_st_ok:
+                return (True, valuesDict)
+
+            errorDict = indigo.Dict()
+            if not pv_dev_ok:
+                errorDict["pvDeviceId"] = "Select a PV device."
+            if not pv_st_ok:
+                errorDict["pvStateId"] = "Select the PV state."
+            return (False, valuesDict, errorDict)
 
         if typeId != "solarsmartLoad":
             return (True, valuesDict)
@@ -2213,6 +2497,9 @@ class Plugin(indigo.PluginBase):
     def battery_device_list(self, filter="", valuesDict=None, typeId="", targetId=0):
         return self._all_devices_menu(include_blank=True)
 
+    def grid_device_list(self, filter="", valuesDict=None, typeId="", targetId=0):
+        return self._all_devices_menu(include_blank=True)
+
     def pv_state_list(self, filter="", valuesDict=None, typeId="", targetId=0):
         dev_id = (valuesDict or {}).get("pvDeviceId")
         return self._state_list_for_device(dev_id)
@@ -2223,6 +2510,10 @@ class Plugin(indigo.PluginBase):
 
     def battery_state_list(self, filter="", valuesDict=None, typeId="", targetId=0):
         dev_id = (valuesDict or {}).get("battDeviceId")
+        return self._state_list_for_device(dev_id, include_blank=True)
+
+    def grid_state_list(self, filter="", valuesDict=None, typeId="", targetId=0):
+        dev_id = (valuesDict or {}).get("gridDeviceId")
         return self._state_list_for_device(dev_id, include_blank=True)
 
     # ────────────────────────────────────────────────────────────
@@ -2251,6 +2542,12 @@ class Plugin(indigo.PluginBase):
             self.logger.debug(f"battery_device_changed: set battStateId=-1 (devId={valuesDict.get('battDeviceId')})")
         return valuesDict
 
+    def grid_device_changed(self, valuesDict, typeId, devId):
+        valuesDict["gridStateId"] = "-1"
+        if getattr(self, "debug2", False):
+            self.logger.debug(f"grid_device_changed: set battStateId=-1 (devId={valuesDict.get('battDeviceId')})")
+        return valuesDict
+
     # ────────────────────────────────────────────────────────────
     # Reading & normalizing selected states (numbers only)
     # Use these in your poller/async loop to fetch Watts as numeric.
@@ -2275,6 +2572,14 @@ class Plugin(indigo.PluginBase):
         if not dev_id or not state_id:
             return None
         return self._read_numeric_state_watts(dev_id, state_id)
+
+    def read_grid_watts(self, props: indigo.Dict) -> Optional[Number]:
+        """Return battery power in Watts as a number (+charge, -discharge if source uses that convention)."""
+        dev_id, state_id = props.get("gridDeviceId"), props.get("gridStateId")
+        if not dev_id or not state_id:
+            return None
+        return self._read_numeric_state_watts(dev_id, state_id)
+
 
     # ────────────────────────────────────────────────────────────
     # Internals
