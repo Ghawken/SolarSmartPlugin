@@ -1,125 +1,83 @@
-# 🌞 SolarSmart for Indigo
+# SolarSmart Indigo Plugin
 
-**SolarSmart** is an Indigo Domotics plugin designed to intelligently schedule and control electrical loads based on **solar production**, **site consumption**, and **battery state of charge (SOC)**.  
-It automates turning loads on and off to maximise self-consumption of solar energy, reduce grid imports, and prevent overload.
+SolarSmart is an Indigo Domotics plugin designed to intelligently control loads (devices) based on your solar production, consumption, battery usage, and optionally net grid usage.
 
----
+![Main Device Setup](https://github.com/Ghawken/SolarSmartPlugin/blob/main/Images/Main_device.png?raw=true)
 
-## 📦 Features
+## What is "Headroom"?
 
-- **Tier-based load scheduling** — higher priority loads run first; lower priority loads start only if headroom is available.
-- **Quota management** — limit runtime per load per day.
-- **Cooldown periods** — prevent rapid on/off cycling of devices.
-- **Max concurrent loads** — avoid exceeding available power or inverter limits.
-- **Emergency shedding** — immediately stop loads if headroom becomes negative.
-- **Per-load surge margin** — account for startup surges when deciding if a load can start.
-- **Test device mode** — override real solar meter readings with manual test values for PV, consumption, and battery power.
-- **Visual scheduler table** — optional PNG rendering showing current scheduling state.
-- **Emoji support** (🌞🔌📈) — works with Apple Color Emoji font at supported sizes.
-- **Adjustable scheduler frequency** — set the number of minutes between scheduling checks.
+Headroom is the amount of *excess power* available that can be used to start and run discretionary loads.
 
----
+Think of it like this:
+- If **Headroom** is *positive*, you have spare power available.
+- If **Headroom** is *negative*, you’re short on power and importing from the grid.
 
-## ⚙️ How It Works
+### Example 1 — Grid-Only Mode:
+```
+Mode: Net Grid mode only — Net grid power will be the only factor in headroom calculations.
+(This is likely the most accurate, if your meters support it)
+This means PV, battery, and site consumption values are reported but ignored.
+Current grid reading: -2424 W → 🔋 Exporting to grid
+Positive headroom of 2424 W — loads may be allowed to start.
+```
+Here, a **negative grid reading** means you are exporting power to the grid. That export amount becomes your headroom.
 
-1. **Reads solar data** from your Indigo devices:
-   - Solar PV production (Watts)
-   - Site consumption (Watts)
-   - Battery charging/discharging power (Watts, optional)
-2. Calculates **headroom**:
-Headroom = PV Production - Site Consumption - Battery Charging
-(Battery discharge increases headroom.)
-3. Runs the **scheduler** at the configured interval:
-- Turns **ON** loads if headroom ≥ load's surge-adjusted requirement and other constraints pass.
-- Turns **OFF** loads if headroom is negative or quotas are exceeded.
-4. Logs **informational events** whenever a device is switched ON or OFF:
-- ON log includes headroom, PV production, and consumption.
-- OFF log includes runtime if available and reason for stopping.
+### Example 2 — PV + Consumption + Battery Mode:
+```
+Mode: PV, site consumption, and battery power used to calculate headroom.
+PV = 3800 W, Site Consumption = 3134 W, Battery = -9000 W (discharging)
+Battery discharge adds to headroom.
+Calculated headroom = 3800 - 3134 + 9000 = 9666 W
+```
+Here, battery discharging increases your headroom because it's adding energy to your home.
 
----
-
-## 🧪 Testing Mode
-
-For safe and repeatable testing without affecting your actual solar system:
-
-1. **Create a “SolarSmart Testing Production” device**:
-- Enter PV, consumption, and battery values as positive/negative integers.
-- Positive battery value = charging; negative = discharging.
-- This test device **overrides** the main solar readings when enabled.
-2. When in use, the plugin logs:
-Using SolarSmart Test device 'SolarSmart Testing Production': PV=8000 W, Cons=2000 W, Batt=0 W
-
-3. **Disable or delete** the test device after testing.
+### Example 3 — No Spare Power:
+```
+Mode: Net Grid mode only
+Current grid reading: 1800 W → ⚡ Importing from grid
+Negative headroom of -1800 W — loads will be stopped.
+```
+Here, **positive grid reading** means you’re importing from the grid, so there’s no excess power available.
 
 ---
 
-## 📋 Device Setup
+## How Loads Are Scheduled
 
-### Main Solar Device
-- Must have **PV Production** state (Watts).
-- Optional: **Site Consumption** and **Battery Power** states.
-- Configure in plugin preferences.
-
-### Load Devices
-Each load you want controlled must be set up as a **SolarSmart Load** with:
-- **Tier** (priority level, 1 = highest)
-- **Rated Watts**
-- **Surge Multiplier** (default 1.2)
-- **Start Margin (%)** (extra headroom buffer)
-- **Quota (minutes/day)**
-- **Cooldown (minutes)**
-- **Action Group** to turn device ON/OFF
+SolarSmart allows you to assign loads to **tiers**. Loads in lower-numbered tiers start first when headroom is available. Higher-tier loads start only if lower tiers are already running and spare headroom remains.
 
 ![Load Device Setup](https://github.com/Ghawken/SolarSmartPlugin/blob/main/Images/Load_Device.png?raw=true)
 
----
+- **Tier 1**: High-priority loads (e.g., pool pump)
+- **Tier 2+**: Secondary loads (e.g., EV charger, water heater)
 
-## 🔧 Plugin Preferences
-
-| Setting | Description |
-| ------- | ----------- |
-| **Time (mins) for Checks** | Interval between scheduling checks. Shorter intervals respond faster to changing conditions but may increase switching frequency. |
-| **Debug Logging** | Enable detailed logging for troubleshooting. |
-| **Debug2 Logging** | Extra-verbose logging including table outputs and decision traces. |
+When headroom drops, loads are turned off starting from the highest tier first.
 
 ---
 
-## 📄 Logging
+## Key Features
 
-- **Info logs**:
-- Device turning ON: `Turning ON 'Pool Pump' — PV=5000 W, Consumption=2500 W, Headroom=2000 W`
-- Device turning OFF: `Turning OFF 'EV Charger' after 45 min — Reason: Lost headroom`
-- **Debug logs** (when enabled):
-- Scheduler decisions per tick.
-- Headroom calculation details.
-- Tier-by-tier table of device states.
+- Choose between **Grid-Only** mode and **PV + Consumption + Battery** mode.
+- Automatic tiered scheduling of loads based on available headroom.
+- Configurable check frequency (minutes between scheduler runs).
+- Quota system to limit maximum runtime per day or other period.
+- Test Device support to simulate solar production and consumption for testing.
 
 ---
 
-## 🚀 Installation
+## Installation
 
-1. Download the plugin from the [GitHub Releases](../../releases) page.
-2. Install into Indigo via **Plugins → Manage Plugins**.
-3. Configure in **Plugins → SolarSmart → Configure...**.
-4. Add your **Main Solar Device** and **SolarSmart Load Devices**.
-5. Optionally create a **SolarSmart Test Device** for simulations.
-
----
-
-## 🧠 Tips & Notes
-
-- Use **accurate rated wattages** for each load to avoid overloading.
-- Set a **reasonable start margin** for surge-prone devices (e.g., pumps, compressors).
-- If using a **battery system**, ensure battery charging/discharging is correctly signed.
-- **One load starts per scheduler tick** — this prevents sudden large changes to load.
-- Emergency shedding removes **only one device per tick** to avoid abrupt shutdowns.
+1. Install the plugin in Indigo.
+2. Create a **SolarSmart Main Device** and configure it with your solar, consumption, battery, or grid meter sources.
+3. Create **SolarSmart Load Devices**, assign them to tiers, and specify how they turn on/off (direct control or via Action Groups).
+4. (Optional) Create a **Test Device** to simulate readings.
 
 ---
 
+## Tips
 
+- **Grid-Only mode** is most accurate if your metering supports it, as it reflects all solar, battery, and consumption in one number.
+- Use **PV + Consumption + Battery mode** if you don’t have a grid meter state available.
+- Keep check frequency reasonable — too short may cause rapid load cycling, too long may miss changes in solar output.
 
-
-
-
-
+---
 
