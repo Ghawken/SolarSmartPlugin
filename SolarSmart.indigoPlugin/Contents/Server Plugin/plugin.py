@@ -197,6 +197,32 @@ class SolarSmartAsyncManager:
             None
         )
 
+    def _sync_running_flags_from_external(self, loads_by_tier: dict[int, list[indigo.Device]]):
+        """
+        For loads controlled by Indigo devices (not action groups), mirror the *actual*
+        device on/off (onOffState) into the SmartSolar load's IsRunning flag.
+        No actions are sent here; we only correct flags so the scheduler can make decisions.
+        """
+        for tier, devs in loads_by_tier.items():
+            for d in devs:
+                ext_on = self.plugin._external_on_state(d)  # helper is in plugin
+                if ext_on is None:
+                    continue  # no onOffState, likely action group controlled
+
+                if self._is_running(d) != bool(ext_on):
+                    self._mark_running(d, bool(ext_on))
+                    d.updateStateOnServer("LastReason", "Sync from external onOffState")
+
+                    # Info log on change
+                    state_str = "ON" if ext_on else "OFF"
+                    self.plugin.logger.info(
+                        f"External state change detected for '{d.name}': now {state_str} "
+                        f"(mirrored into IsRunning)"
+                    )
+
+                    if getattr(self.plugin, "debug2", False):
+                        self.plugin.logger.debug(f"Tick sync: {d.name} IsRunning <- {ext_on}")
+
     def _get_max_concurrent_loads(self) -> int:
         main = self._get_main_device()
         # default if no main or not configured
@@ -362,6 +388,9 @@ class SolarSmartAsyncManager:
 
                 # 2) Collect eligible loads grouped by tier
                 loads_by_tier = self._collect_eligible_loads()
+
+                # 2) Sync IsRunning from real devices (no commands sent)
+                self._sync_running_flags_from_external(loads_by_tier)
 
                 # 3) Decide ON/OFF per tier (waterfall)
                 self._schedule_by_tier(loads_by_tier, headroom_w)
