@@ -20,8 +20,14 @@ import asyncio
 import threading
 import platform
 from datetime import datetime, time as dtime
-from pygments.filters import RaiseOnErrorTokenFilter
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:
+    ZoneInfo = None
 
+import json
+
+import math
 try:
     import indigo
 except:
@@ -31,6 +37,8 @@ import random
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 import re
+# Add near the top with other imports
+from forecast_solar_service import ForecastSolarClient, PVPlane
 
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -343,19 +351,26 @@ class SolarSmartAsyncManager:
         if getattr(self.plugin, "debug2", False):
             self.plugin.logger.debug("_ticker_main_states: exiting (stopThread set)")
 
+        # REPLACE the whole _catchup_scheduler with the version below
+
     def _catchup_scheduler(self, loads_by_tier: dict[int, list[indigo.Device]]):
         """
-        Enforce off-peak catch-up runs, independent of headroom.
-        If a load hasn't met its minRuntimeMins by the catch-up window, force it ON
-        for up to catchupRuntimeMins (or until remaining_needed is satisfied),
-        and stop when the planned catch-up time elapses.
+        Enforce off-peak catch-up runs, largely independent of headroom.
+        Behavior:
+          - Catch-up is ONLY considered if minRuntimeMins has NOT yet been met this quota window.
+          - When inside the catch-up window, we aim to run EXACTLY catchupRuntimeMins over the entire quota window,
+            divided evenly per day if the quota window spans multiple days.
+          - Example: catchupRuntimeMins=60 and quota window=3 days -> target 20 minutes per day.
+          - We never exceed the target per day, and we stop the device once the daily target is met.
+          - If minRuntimeMins is already met, catch-up does nothing (and will stop any ongoing catch-up).
         """
         dbg = getattr(self.plugin, "debug2", False)
         now_dt = datetime.now()
         now_ts = time.time()
+        today_key = now_dt.strftime("%Y-%m-%d")
         now_t = now_dt.time()
 
-        # Compute how many loads are currently running (for optional max concurrency respect)
+        # Optional concurrency respect (keeps system sane even if ignoring headroom)
         running_now = 0
         for _, devs in loads_by_tier.items():
             for d in devs:
@@ -366,99 +381,140 @@ class SolarSmartAsyncManager:
         for tier, devs in loads_by_tier.items():
             for d in devs:
                 props = d.pluginProps or {}
-                if not bool(props.get("enableCatchup", False)):
-                    # If a previous catch-up was active, ensure we clear flags when disabled
-                    st = self.plugin._load_state.setdefault(d.id, {})
-                    if "catchup_until_ts" in st:
-                        st.pop("catchup_until_ts", None)
-                        st.pop("catchup_active", None)
+                st = self.plugin._load_state.setdefault(d.id, {})
+
+                enable = bool(props.get("enableCatchup", False))
+                if not enable:
+                    # Clean up any old flags when disabled
+                    st.pop("catchup_until_ts", None)
+                    st.pop("catchup_active", None)
+                    st.pop("catchup_today_key", None)
+                    st.pop("catchup_today_mins", None)
                     continue
 
                 # Parse window and params
                 start_s = props.get("catchupWindowStart", "00:00")
                 end_s = props.get("catchupWindowEnd", "06:00")
-                run_mins = 0
                 try:
-                    run_mins = max(0, int(props.get("catchupRuntimeMins", "0") or 0))
+                    run_total_mins = max(0, int(props.get("catchupRuntimeMins", "0") or 0))
                 except Exception:
-                    run_mins = 0
+                    run_total_mins = 0
+
+                # If there is no catch-up runtime configured, nothing to do
+                if run_total_mins <= 0:
+                    st.pop("catchup_until_ts", None)
+                    st.pop("catchup_active", None)
+                    st.pop("catchup_today_key", None)
+                    st.pop("catchup_today_mins", None)
+                    continue
+
+                # Daily target = total catchup over the quota window divided by quota days
+                quota_days = max(1, self._get_quota_window_days(props))
+                # Round up to avoid under-running due to integer minutes
+                per_day_target = int(math.ceil(float(run_total_mins) / float(quota_days)))
 
                 start_t = self._parse_hhmm(start_s)
                 end_t = self._parse_hhmm(end_s)
                 in_window = self._time_in_window(now_t, start_t, end_t)
 
-                st = self.plugin._load_state.setdefault(d.id, {})
-                served = int(st.get("served_quota_mins", 0) or 0)
+                # Track daily accumulation just for catch-up minutes (separate from quota served minutes)
+                if st.get("catchup_today_key") != today_key:
+                    st["catchup_today_key"] = today_key
+                    st["catchup_today_mins"] = 0
+
+                catchup_today_m = int(st.get("catchup_today_mins") or 0)
+
+                # Global minimum runtime gating
                 try:
                     min_runtime = int(props.get("minRuntimeMins", 0) or 0)
                 except Exception:
                     min_runtime = 0
 
-                remaining_needed = max(0, min_runtime - served)
+                served = int(st.get("served_quota_mins", 0) or 0)
+                min_needed_remaining = max(0, min_runtime - served)
 
-                # If no minimum to enforce or no run minutes configured, skip
-                if min_runtime <= 0 or run_mins <= 0:
-                    # Clear stale flags if any
+                # If the minimum runtime goal is already met, stop and clear any catch-up
+                if min_runtime > 0 and min_needed_remaining <= 0:
+                    # If a scheduled catch-up was active, stop it.
+                    if self._is_running(d) and st.get("catchup_active"):
+                        reason = "Catch-up not required (minRuntime met)"
+                        if dbg:
+                            self.plugin.logger.debug(f"[CATCHUP STOP] {d.name}: {reason}")
+                        self._ensure_off(d, reason)
                     st.pop("catchup_until_ts", None)
                     st.pop("catchup_active", None)
+                    # We do not reset catchup_today counters here so the UI still reflects what was done today
                     continue
 
-                # 1) If we had a scheduled end, stop when time is up
+                # Determine how much catch-up we can/should run today
+                # Don't exceed per-day target, and don't exceed what's needed to hit minRuntimeMins overall.
+                if min_runtime > 0:
+                    today_cap = min(per_day_target, min_needed_remaining)
+                else:
+                    # If no minRuntimeMins is defined, we enforce per-day target only
+                    today_cap = per_day_target
+
+                # Remaining catch-up minutes we still need to run today
+                remaining_today = max(0, today_cap - catchup_today_m)
+
+                # If we previously scheduled an end time, honor it even if window closed (finish the run)
                 catchup_until_ts = st.get("catchup_until_ts")
                 if catchup_until_ts is not None:
-                    # If window ended before finish, still allow finishing the scheduled run.
                     if now_ts >= float(catchup_until_ts):
+                        # Target done – stop if still ON
                         if self._is_running(d):
                             reason = "Catch-up finished"
-                            # Info stop log
-                            self.plugin.logger.info(f"Stopping '{d.name}' — {reason}.")
+                            if dbg:
+                                self.plugin.logger.debug(f"[CATCHUP STOP] {d.name}: {reason}")
                             self._ensure_off(d, reason)
                         st.pop("catchup_until_ts", None)
                         st.pop("catchup_active", None)
-                        if dbg:
-                            self.plugin.logger.debug(f"{d.name}: catch-up concluded at {now_dt.isoformat()}")
                         continue
-                    # If still within scheduled catch-up duration, ensure it remains ON
-                    # (no-op if already running)
-                    if not self._is_running(d):
-                        self.plugin.logger.info(f"Re-starting '{d.name}' — catch-up still in progress.")
-                        self._ensure_on(d, "Resume catch-up")
-                    continue  # don’t try to start a new block while one is active
+                    else:
+                        # Keep it ON until scheduled end
+                        if not self._is_running(d):
+                            # If someone turned it off externally, turn it back on to finish the planned run
+                            if running_now < max_concurrent:
+                                self._ensure_on(d, "Catch-up in progress (resume)")
+                                running_now += 1
+                        continue
 
-                # 2) No scheduled end: decide whether to start a catch-up run
+                # No scheduled end yet:
+                if remaining_today <= 0:
+                    # We've already met today's catch-up target — ensure catch-up is not running
+                    if self._is_running(d) and st.get("catchup_active"):
+                        if dbg:
+                            self.plugin.logger.debug(f"[CATCHUP STOP] {d.name}: target reached for today")
+                        self._ensure_off(d, "Catch-up target reached (today)")
+                    st.pop("catchup_active", None)
+                    # no need to set until_ts
+                    continue
+
+                # Only start catch-up within the configured window
                 if not in_window:
-                    # Outside the window; nothing to do
-                    st.pop("catchup_active", None)
+                    # Outside window and not previously scheduled — do nothing
                     continue
 
-                if remaining_needed <= 0:
-                    # Already met minimum; nothing to do
-                    st.pop("catchup_active", None)
-                    continue
-
-                # Optional: respect max_concurrent to avoid turning on too many devices at once
-                if running_now >= max_concurrent:
+                # Start catch-up for exactly remaining_today minutes
+                if running_now < max_concurrent:
+                    # Schedule an end timestamp and turn on if not already on
+                    end_ts = now_ts + (remaining_today * 60.0)
+                    st["catchup_until_ts"] = end_ts
+                    st["catchup_active"] = True
+                    if not self._is_running(d):
+                        self._ensure_on(d, f"Catch-up start for {remaining_today} min")
+                        running_now += 1
+                    else:
+                        # Already running (e.g., from headroom) – still pin an end so we stop at the right time
+                        d.updateStateOnServer("LastReason", f"Catch-up pinned for {remaining_today} min")
                     if dbg:
                         self.plugin.logger.debug(
-                            f"{d.name}: catch-up needed but max concurrency reached ({running_now}/{max_concurrent})")
-                    continue
-
-                # Determine how long to run now:
-                # Run the lesser of what's still needed vs. configured catch-up minutes this window
-                duration_mins = min(remaining_needed, run_mins)
-                duration_mins = max(1, duration_mins)  # safety
-
-                # Force ON (ignore headroom) and plan stop time
-                self.plugin.logger.info(
-                    f"Starting '{d.name}' — scheduled catch-up for {duration_mins} min "
-                    f"(remaining to minimum: {remaining_needed} min)."
-                )
-                self._ensure_on(d, "Scheduled catch-up")
-                st["catchup_active"] = True
-                st["catchup_until_ts"] = now_ts + duration_mins * 60.0
-
-                # Update counters so concurrency accounting stays reasonable in this tick
-                running_now += 1
+                            f"[CATCHUP START] {d.name}: today_target={today_cap}m, remaining_today={remaining_today}m, "
+                            f"until={datetime.fromtimestamp(end_ts).strftime('%H:%M:%S')}"
+                        )
+                else:
+                    if dbg:
+                        self.plugin.logger.debug(f"[CATCHUP SKIP] {d.name}: concurrency cap reached")
 
     def _shed_all(self, reason: str, tiers: set[int] | None = None):
         """
@@ -557,9 +613,11 @@ class SolarSmartAsyncManager:
           - RuntimeQuotaMins (RunMin) for quota
           - RuntimeWindowMins for UI
           - Keeps RemainingQuotaMins in sync
+          - Catch-up daily minutes (when catch-up is active)
         """
         add_m = self._quota_tick_minutes(period_sec)
         now_ts = time.time()
+        today_key = datetime.now().strftime("%Y-%m-%d")
         for dev in indigo.devices.iter("self"):
             if dev.deviceTypeId != "solarsmartLoad" or not dev.enabled:
                 continue
@@ -575,6 +633,13 @@ class SolarSmartAsyncManager:
                 dev.updateStateOnServer("RuntimeWindowMins", cur_window + add_m)
             except Exception:
                 pass
+            # Catch-up daily accumulation — only while catch-up is active
+            st = self.plugin._load_state.setdefault(dev.id, {})
+            if st.get("catchup_active"):
+                if st.get("catchup_today_key") != today_key:
+                    st["catchup_today_key"] = today_key
+                    st["catchup_today_mins"] = 0
+                st["catchup_today_mins"] = int(st.get("catchup_today_mins", 0)) + add_m
             # Refresh RemainingQuotaMins
             self._quota_remaining_mins(dev, props, datetime.now())
 
@@ -891,6 +956,20 @@ class SolarSmartAsyncManager:
             "48h": 48 * 60,
             "72h": 72 * 60,
         }.get(key, 24 * 60)
+
+        # Add near other small helpers
+    def _get_quota_window_days(self, props) -> int:
+        """
+        Return the number of days represented by the configured quota window.
+        Uses Devices.xml values (12h, 24h, 1d, 2d, 3d) via _quota_horizon_minutes.
+        12h -> 0.5 day -> ceil to 1 day (we distribute catch-up over 'days' whole days).
+        """
+        period = (props.get("quotaWindow") or "24h").lower()
+        horizon_mins = self._quota_horizon_minutes(period)  # e.g., 720, 1440, 2880, 4320
+        # convert minutes to days; ceil so sub-day windows still count as 1 day for distribution
+        days = max(1, int(math.ceil(float(horizon_mins) / 1440.0)))
+        return days
+
 
     def _maybe_rollover_quota(self, dev: indigo.Device, props: dict, now_ts: float = None):
         """
@@ -2178,7 +2257,8 @@ class Plugin(indigo.PluginBase):
         for d in indigo.devices.iter("self"):
             if d.deviceTypeId == "solarsmartLoad" and d.enabled:
                 self._hydrate_load_state_from_device(d)
-
+            if d.deviceTypeId == "solarsmartMain" and d.enabled:
+                self._update_solar_forecast_for_main(d)
         try:
 
             if not os.path.exists(self.pluginprefDirectory):
@@ -2198,6 +2278,191 @@ class Plugin(indigo.PluginBase):
         self._event_loop.create_task(self._async_start())
         self._event_loop.run_until_complete(self._async_stop())
         self._event_loop.close()
+
+
+    # In your plugin class __init__ (or similar), ensure a client exists:
+    # self._fs_client = ForecastSolarClient(user_agent="SolarSmart/Indigo")
+ ## SOLAR FORECAST
+    # Add these helpers to your plugin class
+    def _wrap_azimuth_deg(self, az: float) -> float:
+        """Normalize azimuth to the range [-180, 180] per forecast.solar requirement."""
+        try:
+            az = float(az)
+        except Exception:
+            return 0.0
+        while az <= -180.0:
+            az += 360.0
+        while az > 180.0:
+            az -= 360.0
+        return az
+
+    def _forecast_updates_per_day(self) -> int:
+        # Fixed to 6/day for now. If you later want it configurable, read from props.
+        return 6
+
+    def _is_time_to_refresh_forecast(self) -> bool:
+        """Guard to ensure we refresh at most N times per day."""
+        try:
+            next_ts = getattr(self, "_fs_next_refresh_ts", 0.0) or 0.0
+            return time.time() >= float(next_ts)
+        except Exception:
+            return True
+
+    def _schedule_next_forecast_refresh(self):
+        """Schedule the next allowed refresh window based on updates per day."""
+        per_day = max(1, int(self._forecast_updates_per_day()))
+        interval_sec = int(86400 / per_day)
+        setattr(self, "_fs_next_refresh_ts", time.time() + interval_sec)
+
+    def _log_forecast_payload(self, main_dev, est):
+        """Log and store summary/peaks using AU date formats; raw payload at DEBUG."""
+        try:
+            # Summary (daily totals)
+            days = []
+            for d in sorted(est.watt_hours_day.keys()):
+                days.append(f"{self._fmt_au_date(d)}: {round(est.watt_hours_day[d] / 1000.0, 2)} kWh")
+            summary_str = ", ".join(days)
+            self.logger.info(f"Forecast.Solar summary: {summary_str}")
+            main_dev.updateStateOnServer("forecastSolarSummary", summary_str)
+
+            # Peaks (by day, using AU date and local datetime formatting)
+            peaks = {}
+            for ts, w in est.watts.items():
+                # Determine the date key from the timestamp (accept T or space)
+                d = ts.split("T")[0] if "T" in ts else ts[:10]
+                if d not in peaks or w > peaks[d][1]:
+                    peaks[d] = (ts, w)
+            if peaks:
+                peak_str = ", ".join(
+                    f"{self._fmt_au_date(d)} @ {self._fmt_au_dt_local(ts_w[0])} = {round(ts_w[1] / 1000.0, 2)} kW"
+                    for d, ts_w in sorted(peaks.items())
+                )
+                self.logger.info(f"Forecast.Solar peaks: {peak_str}")
+                main_dev.updateStateOnServer("forecastSolarPeaks", peak_str)
+
+            # Raw payload at debug (pretty JSON)
+            self.logger.debug("Forecast.Solar raw payload:\n" + json.dumps(est.raw_payload, indent=2)[:100000])
+        except Exception:
+            self.logger.exception("Error while logging Forecast.Solar payload")
+
+    # Place this helper near the top of plugin.py (only define it once)
+    def _fmt_au_date(self, yyyy_mm_dd: str) -> str:
+        """Format a date key 'YYYY-MM-DD' to 'DD-MMM-YYYY' (e.g., 11-Aug-2025)."""
+        if not yyyy_mm_dd:
+            return ""
+        try:
+            d = datetime.fromisoformat(yyyy_mm_dd).date()
+            return d.strftime("%d-%b-%Y")
+        except Exception:
+            # Fallback: try parsing first 10 chars as date
+            try:
+                d = datetime.fromisoformat(yyyy_mm_dd[:10]).date()
+                return d.strftime("%d-%b-%Y")
+            except Exception:
+                return yyyy_mm_dd
+
+    def _fmt_au_dt_local(self, ts: str) -> str:
+        """
+        Parse provider timestamp string and format as local 'DD-MMM-YYYY HH:MM'.
+        Accepts 'YYYY-MM-DD HH:MM[:SS]' or 'YYYY-MM-DDTHH:MM[:SS][±HH:MM|Z]'.
+        If tz-aware, convert to local system timezone; else leave as-is but format AU.
+        """
+        if not ts:
+            return ""
+        s = ts.strip().replace("Z", "+00:00")
+        if " " in s and "T" not in s:
+            s = s.replace(" ", "T")
+        try:
+            dt_obj = datetime.fromisoformat(s)
+        except Exception:
+            # Best-effort fallback: trim to minutes and reformat naive
+            s_simple = s.replace("T", " ")
+            return s_simple[:16] if len(s_simple) >= 16 else s_simple
+        # Convert to local if tz-aware
+        if getattr(dt_obj, "tzinfo", None) is not None:
+            dt_obj = dt_obj.astimezone()
+        return dt_obj.strftime("%d-%b-%Y %H:%M")
+
+    def _update_solar_forecast_for_main(self, main_dev, force=False):
+        """
+        Uses Indigo server latitude/longitude and Forecast.Solar estimate endpoint.
+        Updates only:
+          - forecastTodayDate, forecastTodayKWh, forecastPeakKWToday, forecastPeakTimeToday
+          - forecastTomorrowDate, forecastTomorrowKWh, forecastPeakKWTomorrow, forecastPeakTimeTomorrow
+        Refresh cadence: at most 6 times per day by default.
+        """
+        try:
+            props = main_dev.pluginProps or {}
+            if not bool(props.get("enableSolarForecast", False)):
+                return
+
+            # Guard for refresh cadence (unless forced)
+            if not force and not self._is_time_to_refresh_forecast():
+                self.logger.debug("Forecast.Solar: refresh skipped (not due yet)")
+                return
+
+            # Indigo server location
+            lat, lon = indigo.server.getLatitudeAndLongitude()
+
+            # Plane params from device props
+            dec = float(props.get("fsTiltDeclinationDeg") or 30.0)  # 0 = horizontal, 90 = vertical
+            az = self._wrap_azimuth_deg(props.get("fsAzimuthDeg") or 0.0)  # enforce [-180, 180]
+            kwp = float(props.get("fsSystemKwp") or 5.0)
+
+            if kwp <= 0:
+                self.logger.warning("Forecast.Solar: System kWp must be > 0")
+                return
+
+            plane = PVPlane(latitude=float(lat), longitude=float(lon), dec_deg=dec, az_deg=az, kwp=kwp)
+
+            if not hasattr(self, "_fs_client") or self._fs_client is None:
+                self._fs_client = ForecastSolarClient(user_agent="SolarSmart/Indigo")
+
+            # Fetch with quiet handling of rate limit (429)
+            try:
+                est = self._fs_client.get_estimate(plane, force=bool(force))
+            except RuntimeError as e:
+                msg = str(e)
+                if "429" in msg or "Rate limit" in msg:
+                    self.logger.info("Forecast.Solar rate limit reached; will try again later.")
+                    self._schedule_next_forecast_refresh()
+                    return
+                # Other errors: log once without a stack trace (keep quiet)
+                self.logger.info(f"Forecast.Solar fetch failed: {msg}")
+                self._schedule_next_forecast_refresh()
+                return
+            self._log_forecast_payload(main_dev, est)
+
+            # Build summary (peak + kWh)
+            summary = self._fs_client.summarize(est)
+
+            days = summary.days  # chronological
+
+            # Today
+            if len(days) >= 1:
+                main_dev.updateStateOnServer("forecastTodayDate", days[0].date)
+                main_dev.updateStateOnServer("forecastTodayKWh", f"{days[0].kwh:.2f}")
+                main_dev.updateStateOnServer("forecastPeakKWToday", f"{days[0].peak_kw:.2f}")
+                main_dev.updateStateOnServer("forecastPeakTimeToday", days[0].peak_time or "")
+            # Tomorrow
+            if len(days) >= 2:
+                main_dev.updateStateOnServer("forecastTomorrowDate", days[1].date)
+                main_dev.updateStateOnServer("forecastTomorrowKWh", f"{days[1].kwh:.2f}")
+                main_dev.updateStateOnServer("forecastPeakKWTomorrow", f"{days[1].peak_kw:.2f}")
+                main_dev.updateStateOnServer("forecastPeakTimeTomorrow", days[1].peak_time or "")
+
+
+
+           # Schedule next allowed refresh
+            self._schedule_next_forecast_refresh()
+
+        except Exception:
+            self.logger.exception("Failed to update Forecast.Solar data")
+
+
+## End of Solar forecast
+
+
 
     async def _async_start(self):
         self.logger.debug("_async_start")

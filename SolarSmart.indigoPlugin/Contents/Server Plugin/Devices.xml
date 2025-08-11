@@ -94,6 +94,23 @@
         <Label>Values are expected in Watts. If your source is kW or a string, normalize in the plugin before updating states.</Label>
       </Field>
 
+<Field id="enableSolarForecast" type="checkbox" defaultValue="false">
+  <Label>Enable Solar Forecast (forecast.solar)</Label>
+  <Description>Uses forecast.solar public estimate endpoint with conservative caching to respect rate limits.</Description>
+</Field>
+
+<Field id="fsTiltDeclinationDeg" type="textfield" defaultValue="30"  visibleBindingId="enableSolarForecast" visibleBindingValue="true">
+  <Label>Panel Tilt / Declination (deg)</Label>
+  <Description>0 = horizontal, 90 = vertical</Description>
+</Field>
+<Field id="fsAzimuthDeg" type="textfield" defaultValue="0"  visibleBindingId="enableSolarForecast" visibleBindingValue="true">
+  <Label>Panel Azimuth (deg, 0=South, 90=West, 180=North, 270=East)</Label>
+  <Description>Per forecast.solar convention. For East, you may enter -90 as well.</Description>
+</Field>
+<Field id="fsSystemKwp" type="textfield" defaultValue="5.0"  visibleBindingId="enableSolarForecast" visibleBindingValue="true">
+  <Label>System Size (kWp DC)</Label>
+</Field>
+
 
     </ConfigUI>
 
@@ -152,6 +169,57 @@
   <TriggerLabel>Scheduler Image Path</TriggerLabel>
   <ControlPageLabel>Scheduler Image Path</ControlPageLabel>
 </State>
+      <State id="forecastTodayDate">
+  <ValueType>String</ValueType>
+  <TriggerLabel>Forecast today date changed</TriggerLabel>
+  <ControlPageLabel>Forecast today date</ControlPageLabel>
+</State>
+<State id="forecastTodayKWh">
+  <ValueType>Float</ValueType>
+  <TriggerLabel>Forecast today kWh changed</TriggerLabel>
+  <ControlPageLabel>Forecast today (kWh)</ControlPageLabel>
+</State>
+<State id="forecastPeakKWToday">
+  <ValueType>Float</ValueType>
+  <TriggerLabel>Forecast peak kW today changed</TriggerLabel>
+  <ControlPageLabel>Forecast peak today (kW)</ControlPageLabel>
+</State>
+<State id="forecastPeakTimeToday">
+  <ValueType>String</ValueType>
+  <TriggerLabel>Forecast peak time today changed</TriggerLabel>
+  <ControlPageLabel>Forecast peak time today</ControlPageLabel>
+</State>
+<State id="forecastSolarSummary">
+  <ValueType>String</ValueType>
+  <TriggerLabel>Forecast.Solar summary changed</TriggerLabel>
+  <ControlPageLabel>Forecast.Solar summary lines</ControlPageLabel>
+</State>
+      <State id="forecastSolarPeaks">
+  <ValueType>String</ValueType>
+  <TriggerLabel>Forecast.Solar Peaks</TriggerLabel>
+  <ControlPageLabel>Forecast.Solar Peaks lines</ControlPageLabel>
+</State>
+<State id="forecastTomorrowDate">
+  <ValueType>String</ValueType>
+  <TriggerLabel>Forecast tomorrow date changed</TriggerLabel>
+  <ControlPageLabel>Forecast tomorrow date</ControlPageLabel>
+</State>
+<State id="forecastTomorrowKWh">
+  <ValueType>Float</ValueType>
+  <TriggerLabel>Forecast tomorrow kWh changed</TriggerLabel>
+  <ControlPageLabel>Forecast tomorrow (kWh)</ControlPageLabel>
+</State>
+<State id="forecastPeakKWTomorrow">
+  <ValueType>Float</ValueType>
+  <TriggerLabel>Forecast peak kW tomorrow changed</TriggerLabel>
+  <ControlPageLabel>Forecast peak tomorrow (kW)</ControlPageLabel>
+</State>
+<State id="forecastPeakTimeTomorrow">
+  <ValueType>String</ValueType>
+  <TriggerLabel>Forecast peak time tomorrow changed</TriggerLabel>
+  <ControlPageLabel>Forecast peak time tomorrow</ControlPageLabel>
+</State>
+
     </States>
   </Device>
 
@@ -258,8 +326,8 @@
 <!-- Scheduled catch-up settings -->
      <Field id="sep_catchup" type="separator"/>
 
-        <Field id="catch_hint" type="label" fontColor="darkgray" fontSize="small" alwaysUseInDialogHeightCalc="true">
-      <Label>Scheduled Catchup. If runtime not meant in timeperiod, catchup and run during this window.</Label>
+        <Field id="catch_hint" type="label" fontColor="blue" fontSize="small" alwaysUseInDialogHeightCalc="true">
+      <Label>Scheduled Catchup. If runtime not meant in window time period, catchup and run during this window.</Label>
     </Field>
 <Field id="enableCatchup" type="checkbox" defaultValue="false">
     <Label>Enable Scheduled Catch-up</Label>
