@@ -19,7 +19,7 @@ import traceback
 import asyncio
 import threading
 import platform
-
+from datetime import datetime, time as dtime
 from pygments.filters import RaiseOnErrorTokenFilter
 
 try:
@@ -197,6 +197,23 @@ class SolarSmartAsyncManager:
             None
         )
 
+    def _parse_hhmm(self, s: str) -> dtime:
+        s = (s or "").strip()
+        try:
+            hh, mm = s.split(":")
+            return dtime(hour=int(hh), minute=int(mm))
+        except Exception:
+            # Safe default if bad input
+            return dtime(0, 0)
+
+    def _time_in_window(self, now_t: dtime, start_t: dtime, end_t: dtime) -> bool:
+        # Handles normal and overnight windows (e.g., 23:00 -> 06:00)
+        if start_t < end_t:
+            return start_t <= now_t < end_t
+        else:
+            return (now_t >= start_t) or (now_t < end_t)
+
+
     def _sync_running_flags_from_external(self, loads_by_tier: dict[int, list[indigo.Device]]):
         """
         For loads controlled by Indigo devices (not action groups), mirror the *actual*
@@ -326,47 +343,122 @@ class SolarSmartAsyncManager:
         if getattr(self.plugin, "debug2", False):
             self.plugin.logger.debug("_ticker_main_states: exiting (stopThread set)")
 
-    def _catchup_check(self, loads_by_tier):
-        now = datetime.now().time()
+    def _catchup_scheduler(self, loads_by_tier: dict[int, list[indigo.Device]]):
+        """
+        Enforce off-peak catch-up runs, independent of headroom.
+        If a load hasn't met its minRuntimeMins by the catch-up window, force it ON
+        for up to catchupRuntimeMins (or until remaining_needed is satisfied),
+        and stop when the planned catch-up time elapses.
+        """
+        dbg = getattr(self.plugin, "debug2", False)
+        now_dt = datetime.now()
+        now_ts = time.time()
+        now_t = now_dt.time()
+
+        # Compute how many loads are currently running (for optional max concurrency respect)
+        running_now = 0
+        for _, devs in loads_by_tier.items():
+            for d in devs:
+                if self._is_running(d):
+                    running_now += 1
+        max_concurrent = self._get_max_concurrent_loads()
+
         for tier, devs in loads_by_tier.items():
             for d in devs:
                 props = d.pluginProps or {}
-                if not props.get("enableCatchup", False):
+                if not bool(props.get("enableCatchup", False)):
+                    # If a previous catch-up was active, ensure we clear flags when disabled
+                    st = self.plugin._load_state.setdefault(d.id, {})
+                    if "catchup_until_ts" in st:
+                        st.pop("catchup_until_ts", None)
+                        st.pop("catchup_active", None)
                     continue
-                # parse the start and end times (e.g. "23:00" -> time object)
-                start_str = props.get("catchupWindowStart", "00:00")
-                end_str = props.get("catchupWindowEnd", "06:00")
-                run_mins = int(props.get("catchupRuntimeMins", "0") or 0)
 
-                start_time = datetime.strptime(start_str, "%H:%M").time()
-                end_time = datetime.strptime(end_str, "%H:%M").time()
+                # Parse window and params
+                start_s = props.get("catchupWindowStart", "00:00")
+                end_s = props.get("catchupWindowEnd", "06:00")
+                run_mins = 0
+                try:
+                    run_mins = max(0, int(props.get("catchupRuntimeMins", "0") or 0))
+                except Exception:
+                    run_mins = 0
 
-                # check if now is inside window (allowing for cross‑midnight)
-                in_window = (
-                    (start_time <= now < end_time) if start_time < end_time
-                    else (now >= start_time or now < end_time)
-                )
+                start_t = self._parse_hhmm(start_s)
+                end_t = self._parse_hhmm(end_s)
+                in_window = self._time_in_window(now_t, start_t, end_t)
+
+                st = self.plugin._load_state.setdefault(d.id, {})
+                served = int(st.get("served_quota_mins", 0) or 0)
+                try:
+                    min_runtime = int(props.get("minRuntimeMins", 0) or 0)
+                except Exception:
+                    min_runtime = 0
+
+                remaining_needed = max(0, min_runtime - served)
+
+                # If no minimum to enforce or no run minutes configured, skip
+                if min_runtime <= 0 or run_mins <= 0:
+                    # Clear stale flags if any
+                    st.pop("catchup_until_ts", None)
+                    st.pop("catchup_active", None)
+                    continue
+
+                # 1) If we had a scheduled end, stop when time is up
+                catchup_until_ts = st.get("catchup_until_ts")
+                if catchup_until_ts is not None:
+                    # If window ended before finish, still allow finishing the scheduled run.
+                    if now_ts >= float(catchup_until_ts):
+                        if self._is_running(d):
+                            reason = "Catch-up finished"
+                            # Info stop log
+                            self.plugin.logger.info(f"Stopping '{d.name}' — {reason}.")
+                            self._ensure_off(d, reason)
+                        st.pop("catchup_until_ts", None)
+                        st.pop("catchup_active", None)
+                        if dbg:
+                            self.plugin.logger.debug(f"{d.name}: catch-up concluded at {now_dt.isoformat()}")
+                        continue
+                    # If still within scheduled catch-up duration, ensure it remains ON
+                    # (no-op if already running)
+                    if not self._is_running(d):
+                        self.plugin.logger.info(f"Re-starting '{d.name}' — catch-up still in progress.")
+                        self._ensure_on(d, "Resume catch-up")
+                    continue  # don’t try to start a new block while one is active
+
+                # 2) No scheduled end: decide whether to start a catch-up run
                 if not in_window:
+                    # Outside the window; nothing to do
+                    st.pop("catchup_active", None)
                     continue
 
-                # ensure we haven't already met the minimum runtime quota
-                served = self.plugin._load_state.setdefault(d.id, {}).get("served_quota_mins", 0)
-                min_runtime = int(props.get("minRuntimeMins", 0) or 0)
-                if served >= min_runtime:
+                if remaining_needed <= 0:
+                    # Already met minimum; nothing to do
+                    st.pop("catchup_active", None)
                     continue
 
-                # compute how many minutes are still required
-                remaining_needed = min_runtime - served
-                # run at least the configured catchup minutes
-                catchup_needed = max(run_mins, remaining_needed)
+                # Optional: respect max_concurrent to avoid turning on too many devices at once
+                if running_now >= max_concurrent:
+                    if dbg:
+                        self.plugin.logger.debug(
+                            f"{d.name}: catch-up needed but max concurrency reached ({running_now}/{max_concurrent})")
+                    continue
 
-                # if device is OFF and needs catch‑up, turn it on (ignore headroom)
-                if not self._is_running(d):
-                    self._ensure_on(d, f"Scheduled catch‑up run for {catchup_needed} min (remaining quota)")
+                # Determine how long to run now:
+                # Run the lesser of what's still needed vs. configured catch-up minutes this window
+                duration_mins = min(remaining_needed, run_mins)
+                duration_mins = max(1, duration_mins)  # safety
 
-                # note: you may need to store a “catch‑up end” time to turn it off after run_mins
-                # or rely on the normal cooldown/time logic in the plugin to handle off.
+                # Force ON (ignore headroom) and plan stop time
+                self.plugin.logger.info(
+                    f"Starting '{d.name}' — scheduled catch-up for {duration_mins} min "
+                    f"(remaining to minimum: {remaining_needed} min)."
+                )
+                self._ensure_on(d, "Scheduled catch-up")
+                st["catchup_active"] = True
+                st["catchup_until_ts"] = now_ts + duration_mins * 60.0
 
+                # Update counters so concurrency accounting stays reasonable in this tick
+                running_now += 1
 
     def _shed_all(self, reason: str, tiers: set[int] | None = None):
         """
@@ -429,13 +521,18 @@ class SolarSmartAsyncManager:
                     continue
 
                 # 2) Collect eligible loads grouped by tier
-                loads_by_tier = self._collect_eligible_loads()
+                #loads_by_tier = self._collect_eligible_loads()
+                # 2) Collect all loads grouped by tier + per-load skip reasons
+                loads_by_tier, skip_reasons = self._collect_loads_with_reasons()
 
                 # 2) Sync IsRunning from real devices (no commands sent)
                 self._sync_running_flags_from_external(loads_by_tier)
 
-                # 3) Decide ON/OFF per tier (waterfall)
-                self._schedule_by_tier(loads_by_tier, headroom_w)
+                # 3) Decide ON/OFF per tier (waterfall), but keep all in the table
+                self._schedule_by_tier(loads_by_tier, headroom_w, skip_reasons)
+
+                # >>> ADD THIS: enforce catch-up (ignores headroom)
+                self._catchup_scheduler(loads_by_tier)
 
                 self._accrue_runtime_for_running_loads(period_sec)
 
@@ -846,12 +943,18 @@ class SolarSmartAsyncManager:
             self.plugin.logger.exception(f"_maybe_rollover_quota: error on {dev.name}")
 
     # ========== Gather loads ==========
-    def _collect_eligible_loads(self) -> dict[int, list[indigo.Device]]:
+    def _collect_loads_with_reasons(self) -> tuple[dict[int, list[indigo.Device]], dict[int, str]]:
         """
-        Return dict tier -> [load devices], **eligible** by window/DOW/quota.
-        Within a tier, we’ll later sort by least served quota to be fair.
+        Return:
+          - dict of tier -> [all load devices], regardless of eligibility
+          - dict of device.id -> skip_reason (string) for ineligible loads
+
+        Ineligible loads are included in tables with SKIP(reason), but won't be
+        considered for start decisions. We still enforce OFF for those cases.
         """
         tiers: dict[int, list[indigo.Device]] = {}
+        skip_reasons: dict[int, str] = {}
+
         now = datetime.now()
 
         for dev in indigo.devices.iter("self"):
@@ -859,32 +962,32 @@ class SolarSmartAsyncManager:
                 continue
 
             props = dev.pluginProps or {}
+            reason: str | None = None
 
-            # DOW allowed?
+            # Determine reason (first-match)
             if not _dow_allowed(props, now):
-                self._ensure_off(dev, "Window closed (DOW)")
-                continue
+                reason = "window (DOW)"
+            elif not _time_window_allowed(props, now):
+                reason = "window (time)"
+            else:
+                remaining = self._quota_remaining_mins(dev, props, now)
+                if remaining <= 0:
+                    reason = "quota"
 
-            # Time window allowed?
-            if not _time_window_allowed(props, now):
-                self._ensure_off(dev, "Window closed (time)")
-                continue
+            # Reflect enforcement for ineligible loads
+            if reason:
+                self._ensure_off(dev, f"Not eligible: {reason}")
 
-            # Quota remaining?
-            remaining = self._quota_remaining_mins(dev, props, now)
-            if remaining <= 0:
-                self._ensure_off(dev, "Quota exhausted")
-                continue
-
-            # Good: put into its tier
             tier = int(props.get("tier", 2))
             tiers.setdefault(tier, []).append(dev)
+            if reason:
+                skip_reasons[dev.id] = reason
 
-        # Fairness: sort each tier by least served quota minutes
+        # Fairness: sort each tier by least served quota minutes (keeps all loads)
         for t in tiers:
             tiers[t].sort(key=lambda d: self._served_quota_mins(d))
-        return dict(sorted(tiers.items(), key=lambda kv: kv[0]))  # lowest tier number first
 
+        return dict(sorted(tiers.items(), key=lambda kv: kv[0])), skip_reasons
 
 
     # ========== ON/OFF decisions per tier ==========
@@ -917,11 +1020,10 @@ class SolarSmartAsyncManager:
 
         return None
 
-    def _schedule_by_tier(self, loads_by_tier: dict[int, list[indigo.Device]], headroom_w: int):
+    def _schedule_by_tier(self, loads_by_tier: dict[int, list[indigo.Device]], headroom_w: int, skip_reasons: dict[int, str]):
 
         max_concurrent = self._get_max_concurrent_loads()
         starts_this_tick = 0
-
         table_rows = []  # for final summary table
 
         # Rollover quota windows if needed (minimal change: just call it)
@@ -969,9 +1071,18 @@ class SolarSmartAsyncManager:
                 start_margin = float(props.get("startMarginPct", "20") or 20.0) / 100.0
                 needed_w = int(rated * surge_mult * (1.0 + start_margin))
 
-                status = "RUN" if self._is_running(d) else "OFF"
-                action = ""
+                #status = "RUN" if self._is_running(d) else "OFF"
+                #action = ""
                 before_headroom = headroom_w
+
+                # 1) If there is a skip reason, show row and do not attempt start
+                skip_reason = skip_reasons.get(d.id)
+                if skip_reason:
+                    status = "RUN" if self._is_running(d) else "OFF"
+                    action = f"SKIP ({skip_reason})"
+                    table_rows.append((tier, d.name, rated, status, remaining, before_headroom, needed_w, action))
+                    # Do not modify headroom or attempt start
+                    continue
 
                 if self._is_running(d):
                     # Decide KEEP vs STOP
@@ -987,34 +1098,36 @@ class SolarSmartAsyncManager:
                     else:
                         action = "KEEP"
                         status = "RUN"
-                else:
-                    # start constraints
-                    if starts_this_tick >= 1:
-                        action = "SKIP (cap)"
-                        status = "OFF"
-                    elif running_now >= max_concurrent:
-                        action = "SKIP (conc)"
-                        status = "OFF"
-                    elif remaining <= 0:
-                        action = "SKIP (quota)"
-                        status = "OFF"
-                    elif not self._cooldown_met(d, int(props.get("cooldownMins") or 0)):
-                        action = "SKIP (cooldn)"
-                        status = "OFF"
-                    elif headroom_w >= needed_w:
-                        # Start exactly ONE load per tick
-                        self._ensure_on(d, "Start ok (threshold met)", headroom_snapshot=headroom_w)
-                        starts_this_tick += 1
-                        running_now += 1
-                        action = "START"
-                        status = "RUN"
-                        if dbg:
-                            self.plugin.logger.debug(f"[START] {d.name}: rated={rated}W → headroom now {headroom_w}W")
-                    else:
-                        action = "SKIP (headrm)"
-                        status = "OFF"
+                    table_rows.append((tier, d.name, rated, status, remaining, before_headroom, needed_w, action))
+                    continue
 
-                # (if you still build the table, append row here)
+            # start constraints
+                if starts_this_tick >= 1:
+                    action = "SKIP (cap)"
+                    status = "OFF"
+                elif running_now >= max_concurrent:
+                    action = "SKIP (conc)"
+                    status = "OFF"
+                elif remaining <= 0:
+                    action = "SKIP (quota)"
+                    status = "OFF"
+                elif not self._cooldown_met(d, int(props.get("cooldownMins") or 0)):
+                    action = "SKIP (cooldownn)"
+                    status = "OFF"
+                elif headroom_w >= needed_w:
+                    # Start exactly ONE load per tick
+                    self._ensure_on(d, "Start ok (threshold met)", headroom_snapshot=headroom_w)
+                    starts_this_tick += 1
+                    running_now += 1
+                    action = "START"
+                    status = "RUN"
+                    if dbg:
+                        self.plugin.logger.debug(f"[START] {d.name}: rated={rated}W → headroom now {headroom_w}W")
+                else:
+                    action = "SKIP (headroom)"
+                    status = "OFF"
+
+            # (if you still build the table, append row here)
                 table_rows.append((tier, d.name, rated, status, remaining, before_headroom, needed_w, action))
 
         # OPTIONAL: final safety shed — shed only ONE more if still negative.

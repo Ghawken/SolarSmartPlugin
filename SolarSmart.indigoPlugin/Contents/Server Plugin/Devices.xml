@@ -257,9 +257,13 @@
     <Field id="dowSun" type="checkbox" defaultValue="true"><Label>Sunday</Label></Field>
 <!-- Scheduled catch-up settings -->
      <Field id="sep_catchup" type="separator"/>
+
+        <Field id="catch_hint" type="label" fontColor="darkgray" fontSize="small" alwaysUseInDialogHeightCalc="true">
+      <Label>Scheduled Catchup. If runtime not meant in timeperiod, catchup and run during this window.</Label>
+    </Field>
 <Field id="enableCatchup" type="checkbox" defaultValue="false">
     <Label>Enable Scheduled Catch-up</Label>
-    <Description>If enabled, the load will turn on in the catch‑up window if its minimum runtime has not been met during the day.</Description>
+    <Description></Description>
 </Field>
 
 <Field id="catchupWindowStart" type="textfield" defaultValue="00:00">
@@ -276,6 +280,7 @@
     <Label>Catch-up Runtime (mins)</Label>
     <Description>Minimum minutes to run during the catch‑up window if the daily minimum runtime hasn’t been met.</Description>
 </Field>
+
     <!-- Runtime constraints -->
     <Field id="sep_runtime" type="separator"/>
     <Field id="minRuntimeMins" type="textfield" defaultValue="30">
