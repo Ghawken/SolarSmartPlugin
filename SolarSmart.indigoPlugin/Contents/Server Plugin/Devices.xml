@@ -98,7 +98,7 @@
     </ConfigUI>
 
     <!-- Show PV production in device list -->
-    <UiDisplayStateId>SolarProduction</UiDisplayStateId>
+    <UiDisplayStateId>Headroom</UiDisplayStateId>
 
     <States>
       <State id="SolarProduction">
@@ -255,7 +255,27 @@
     <Field id="dowFri" type="checkbox" defaultValue="true"><Label>Friday</Label></Field>
     <Field id="dowSat" type="checkbox" defaultValue="true"><Label>Saturday</Label></Field>
     <Field id="dowSun" type="checkbox" defaultValue="true"><Label>Sunday</Label></Field>
+<!-- Scheduled catch-up settings -->
+     <Field id="sep_catchup" type="separator"/>
+<Field id="enableCatchup" type="checkbox" defaultValue="false">
+    <Label>Enable Scheduled Catch-up</Label>
+    <Description>If enabled, the load will turn on in the catch‑up window if its minimum runtime has not been met during the day.</Description>
+</Field>
 
+<Field id="catchupWindowStart" type="textfield" defaultValue="00:00">
+    <Label>Catch-up Window Start</Label>
+    <Description>Start time (HH:MM) for off‑peak catch‑up.</Description>
+</Field>
+
+<Field id="catchupWindowEnd" type="textfield" defaultValue="06:00">
+    <Label>Catch-up Window End</Label>
+    <Description>End time (HH:MM) for off‑peak catch‑up.</Description>
+</Field>
+
+<Field id="catchupRuntimeMins" type="textfield" defaultValue="60">
+    <Label>Catch-up Runtime (mins)</Label>
+    <Description>Minimum minutes to run during the catch‑up window if the daily minimum runtime hasn’t been met.</Description>
+</Field>
     <!-- Runtime constraints -->
     <Field id="sep_runtime" type="separator"/>
     <Field id="minRuntimeMins" type="textfield" defaultValue="30">

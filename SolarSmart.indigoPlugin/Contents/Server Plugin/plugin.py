@@ -326,6 +326,48 @@ class SolarSmartAsyncManager:
         if getattr(self.plugin, "debug2", False):
             self.plugin.logger.debug("_ticker_main_states: exiting (stopThread set)")
 
+    def _catchup_check(self, loads_by_tier):
+        now = datetime.now().time()
+        for tier, devs in loads_by_tier.items():
+            for d in devs:
+                props = d.pluginProps or {}
+                if not props.get("enableCatchup", False):
+                    continue
+                # parse the start and end times (e.g. "23:00" -> time object)
+                start_str = props.get("catchupWindowStart", "00:00")
+                end_str = props.get("catchupWindowEnd", "06:00")
+                run_mins = int(props.get("catchupRuntimeMins", "0") or 0)
+
+                start_time = datetime.strptime(start_str, "%H:%M").time()
+                end_time = datetime.strptime(end_str, "%H:%M").time()
+
+                # check if now is inside window (allowing for cross‑midnight)
+                in_window = (
+                    (start_time <= now < end_time) if start_time < end_time
+                    else (now >= start_time or now < end_time)
+                )
+                if not in_window:
+                    continue
+
+                # ensure we haven't already met the minimum runtime quota
+                served = self.plugin._load_state.setdefault(d.id, {}).get("served_quota_mins", 0)
+                min_runtime = int(props.get("minRuntimeMins", 0) or 0)
+                if served >= min_runtime:
+                    continue
+
+                # compute how many minutes are still required
+                remaining_needed = min_runtime - served
+                # run at least the configured catchup minutes
+                catchup_needed = max(run_mins, remaining_needed)
+
+                # if device is OFF and needs catch‑up, turn it on (ignore headroom)
+                if not self._is_running(d):
+                    self._ensure_on(d, f"Scheduled catch‑up run for {catchup_needed} min (remaining quota)")
+
+                # note: you may need to store a “catch‑up end” time to turn it off after run_mins
+                # or rely on the normal cooldown/time logic in the plugin to handle off.
+
+
     def _shed_all(self, reason: str, tiers: set[int] | None = None):
         """
         Turn OFF all running SmartSolar Load devices.
