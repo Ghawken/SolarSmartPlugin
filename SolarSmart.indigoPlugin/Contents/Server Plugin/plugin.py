@@ -2334,7 +2334,7 @@ class Plugin(indigo.PluginBase):
                     peaks[d] = (ts, w)
             if peaks:
                 peak_str = ", ".join(
-                    f"{self._fmt_au_date(d)} @ {self._fmt_au_dt_local(ts_w[0])} = {round(ts_w[1] / 1000.0, 2)} kW"
+                    f"Peaks: {self._fmt_au_dt_local(ts_w[0])} = {round(ts_w[1] / 1000.0, 2)} kW"
                     for d, ts_w in sorted(peaks.items())
                 )
                 self.logger.info(f"Forecast.Solar peaks: {peak_str}")
