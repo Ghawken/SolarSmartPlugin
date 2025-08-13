@@ -1,58 +1,33 @@
 from __future__ import annotations
 
 """
-Lightweight Forecast.Solar client with per-plane caching and summaries.
-
-Docs:
-- API: https://doc.forecast.solar/api:estimate
-- Content type: https://doc.forecast.solar/api#content_type
-- Endpoint: https://api.forecast.solar/estimate/:lat/:lon/:dec/:az/:kwp
-
-Public plan: 1 plane per API call, estimate data only, rate limited (typically 12/hour/zone).
-"""
-
-"""
 Forecast.Solar client with:
 - Per-plane caching
 - time=utc query param
-- Timestamp normalization to local system time ("YYYY-MM-DD HH:MM")
+- Robust UTC -> local timestamp normalization (DST safe)
+- Local-day aggregation (so production totals match local calendar days)
 - Compact summaries
-
-Docs:
-- API: https://doc.forecast.solar/api:estimate
-- Content type: https://doc.forecast.solar/api#content_type
-- Endpoint: https://api.forecast.solar/estimate/:lat/:lon/:dec/:az/:kwp?time=utc
 """
-
-
 
 import time
 import json
 import logging
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, Any, List
-from datetime import datetime
+from datetime import datetime, timezone
 
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
 except Exception:
-    ZoneInfo = None
+    ZoneInfo = None  # Fallback handled later
 
 import requests
-
 
 log = logging.getLogger("ForecastSolarClient")
 
 
 @dataclass(frozen=True)
 class PVPlane:
-    """
-    Forecast.Solar plane parameters.
-
-    dec_deg: declination/tilt in degrees (0 = horizontal, 90 = vertical)
-    az_deg: azimuth in degrees, -180..180 where 0 = South, +90 = West, -90 = East, ±180 = North.
-    kwp: DC system size in kWp (e.g., 5.0)
-    """
     latitude: float
     longitude: float
     dec_deg: float
@@ -69,7 +44,8 @@ class RateLimitInfo:
 
 
 class ForecastSolarRateLimitError(Exception):
-    def __init__(self, message: str, period: Optional[int] = None, limit: Optional[int] = None, remaining: Optional[int] = None):
+    def __init__(self, message: str, period: Optional[int] = None,
+                 limit: Optional[int] = None, remaining: Optional[int] = None):
         super().__init__(message)
         self.period = period
         self.limit = limit
@@ -78,212 +54,282 @@ class ForecastSolarRateLimitError(Exception):
 
 @dataclass
 class ForecastSolarEstimate:
-    # All timestamped series keys are normalized to local system time in "YYYY-MM-DD HH:MM".
+    # All timestamped series keys are LOCAL system time strings: "YYYY-MM-DD HH:MM"
     watts: Dict[str, float]
     watt_hours_period: Dict[str, float]
     watt_hours: Dict[str, float]
-    # Day totals are normalized to "YYYY-MM-DD" (no tz shift applied).
+    # Day totals aggregated by LOCAL date: "YYYY-MM-DD"
     watt_hours_day: Dict[str, float]
-    timezone: Optional[str]
-    time_local: Optional[str]
-    time_utc: Optional[str]
+    timezone: Optional[str]        # API-declared timezone (if provided)
+    time_local: Optional[str]      # API "time" converted to local
+    time_utc: Optional[str]        # API "time" original (UTC)
     ratelimit: RateLimitInfo
-    raw_payload: Dict[str, Any]
+    raw_payload: Dict[str, Any]    # Original JSON (unchanged)
 
 
 @dataclass
 class ForecastSummaryDay:
-    date: str            # "YYYY-MM-DD"
+    date: str        # Local date "YYYY-MM-DD"
     kwh: float
     peak_kw: float
-    peak_time: Optional[str]  # Local system time "YYYY-MM-DD HH:MM"
+    peak_time: Optional[str]  # Local "YYYY-MM-DD HH:MM"
 
 
 @dataclass
 class ForecastSummary:
-    days: List[ForecastSummaryDay]  # ordered chronologically
+    days: List[ForecastSummaryDay]
     provider: str = "forecast.solar"
 
 
 class ForecastSolarClient:
-    """
-    Simple client with:
-    - In-memory per-plane cache
-    - Fetches UTC timestamps from Forecast.Solar (time=utc)
-    - Normalizes them to local system time ("YYYY-MM-DD HH:MM")
-    """
+    BASE_URL = "https://api.forecast.solar/estimate"
 
-    BASE_URL = "https://api.forecast.solar"
-    MIN_REFRESH_SEC = 3600  # do not refetch within an hour by default
+    def __init__(self,
+                 user_agent: str = "SolarSmart/1.0",
+                 session: Optional[requests.Session] = None,
+                 local_timezone: Optional[str] = None,
+                 cache_ttl_sec: int = 900,
+                 keep_instantaneous: bool = True):
+        """
+        local_timezone: Optional IANA tz name. If None, system local timezone is used.
+        keep_instantaneous: Keep non whole-hour timestamps (current point like 20:35:46Z). If False, filter them.
+        """
+        self.session = session or requests.Session()
+        self.session.headers["User-Agent"] = user_agent
+        self.cache_ttl_sec = cache_ttl_sec
+        self.keep_instantaneous = keep_instantaneous
 
-    def __init__(self, user_agent: str = "SolarSmart/1.0 (+Indigo Plugin)"):
-        self._ua = user_agent
-        # cache key -> (expires_ts, ForecastSolarEstimate)
-        self._cache: Dict[str, Tuple[float, ForecastSolarEstimate]] = {}
+        # Resolve local tz
+        if local_timezone and ZoneInfo:
+            try:
+                self.local_tz = ZoneInfo(local_timezone)
+            except Exception:
+                log.warning(f"Invalid timezone '{local_timezone}', falling back to system local.")
+                self.local_tz = self._system_local_tz()
+        else:
+            self.local_tz = self._system_local_tz()
 
-    def _plane_key(self, plane: PVPlane) -> str:
-        return f"{plane.latitude:.5f},{plane.longitude:.5f},{plane.dec_deg:.1f},{plane.az_deg:.1f},{plane.kwp:.3f}"
+        self._cache: Dict[PVPlane, Tuple[float, ForecastSolarEstimate]] = {}
 
-    def get_estimate(self, plane: PVPlane, force: bool = False) -> ForecastSolarEstimate:
-        key = self._plane_key(plane)
+    # ------------- Public API -------------
+
+    def get_estimate(self, plane: PVPlane, timeout: float = 10.0) -> ForecastSolarEstimate:
+        """
+        Return (possibly cached) forecast for given plane with timestamps normalized to local time.
+        """
         now = time.time()
-        cached = self._cache.get(key)
-
-        if cached and not force:
-            expires_ts, data = cached
-            if now < expires_ts:
-                return data
+        cached = self._cache.get(plane)
+        if cached and (now - cached[0]) < self.cache_ttl_sec:
+            return cached[1]
 
         url = self._build_url(plane)
-        headers = {"Accept": "application/json", "User-Agent": self._ua}
+        resp = self.session.get(url, timeout=timeout)
+        if resp.status_code == 429:
+            raise self._rate_limit_error(resp)
 
-        resp = requests.get(url, headers=headers, timeout=20)
-        if resp.status_code != 200:
-            raise RuntimeError(f"Forecast.Solar HTTP {resp.status_code}: {resp.text[:200]}")
+        resp.raise_for_status()
+        payload = resp.json()
 
-        try:
-            payload = resp.json()
-        except Exception:
-            payload = json.loads(resp.text or "{}")
+        estimate = self._normalize_payload(payload)
+        self._cache[plane] = (now, estimate)
+        return estimate
 
-        # Validate
-        msg = ((payload or {}).get("message") or {})
-        if (msg.get("type") or "").lower() != "success":
-            raise RuntimeError(f"Forecast.Solar error: {msg}")
+    def summarize(self, estimate: ForecastSolarEstimate) -> ForecastSummary:
+        days = []
+        # Derive peak per local day from watts series
+        day_peak: Dict[str, Tuple[float, str]] = {}
+        for ts, w in estimate.watts.items():
+            # ts = "YYYY-MM-DD HH:MM"
+            day = ts[:10]
+            cur_peak = day_peak.get(day)
+            if (cur_peak is None) or (w > cur_peak[0]):
+                day_peak[day] = (w, ts)
 
-        result = payload.get("result") or {}
-        info = payload.get("info") or {}
-        ratelimit = payload.get("ratelimit") or {}
+        for day, wh in sorted(estimate.watt_hours_day.items()):
+            peak_w = 0.0
+            peak_time = None
+            if day in day_peak:
+                peak_w, peak_ts = day_peak[day]
+                peak_time = peak_ts
+            days.append(
+                ForecastSummaryDay(
+                    date=day,
+                    kwh=round(wh / 1000.0, 3),
+                    peak_kw=round(peak_w / 1000.0, 3),
+                    peak_time=peak_time
+                )
+            )
+        return ForecastSummary(days=days)
 
-        # Convert timestamped series (which are in UTC due to time=utc) to local "YYYY-MM-DD HH:MM"
-        watts_norm = _normalize_utc_series_to_local(result.get("watts") or {})
-        whp_norm = _normalize_utc_series_to_local(result.get("watt_hours_period") or {})
-        wh_norm = _normalize_utc_series_to_local(result.get("watt_hours") or {})
-
-        # Day totals: ensure "YYYY-MM-DD" (no tz shift)
-        wh_day_norm = _normalize_day_keys_no_tzshift(result.get("watt_hours_day") or {})
-
-        est = ForecastSolarEstimate(
-            watts=watts_norm,
-            watt_hours_period=whp_norm,
-            watt_hours=wh_norm,
-            watt_hours_day={k: float(v) for k, v in wh_day_norm.items()},
-            timezone=info.get("timezone"),
-            time_local=info.get("time"),
-            time_utc=info.get("time_utc"),
-            ratelimit=RateLimitInfo(
-                zone=ratelimit.get("zone"),
-                period=_safe_int(ratelimit.get("period")),
-                limit=_safe_int(ratelimit.get("limit")),
-                remaining=_safe_int(ratelimit.get("remaining")),
-            ),
-            raw_payload=payload,
-        )
-
-        # Cache expiry: honor period if provided; otherwise 1 hour, min 5 minutes
-        period = est.ratelimit.period or self.MIN_REFRESH_SEC
-        expires_ts = now + max(300, int(period))
-        self._cache[key] = (expires_ts, est)
-        return est
-
-    def summarize(self, est: ForecastSolarEstimate) -> ForecastSummary:
-        days_sorted = sorted(est.watt_hours_day.items(), key=lambda kv: kv[0])
-        day_kwh = [(d, round(float(wh) / 1000.0, 2)) for d, wh in days_sorted]
-
-        watts_by_day: Dict[str, List[Tuple[str, float]]] = {}
-        for ts_local, w in est.watts.items():
-            d = ts_local[:10]  # "YYYY-MM-DD"
-            watts_by_day.setdefault(d, []).append((ts_local, float(w)))
-
-        out_days: List[ForecastSummaryDay] = []
-        for d, kwh in day_kwh:
-            lst = sorted(watts_by_day.get(d, []), key=lambda kv: kv[0])
-            if lst:
-                peak_ts, peak_w = max(lst, key=lambda kv: kv[1])
-                out_days.append(ForecastSummaryDay(
-                    date=d,
-                    kwh=kwh,
-                    peak_kw=round(peak_w / 1000.0, 2),
-                    peak_time=peak_ts,  # already local "YYYY-MM-DD HH:MM"
-                ))
-            else:
-                out_days.append(ForecastSummaryDay(date=d, kwh=kwh, peak_kw=0.0, peak_time=None))
-
-        return ForecastSummary(days=out_days, provider="forecast.solar")
+    # ------------- Internal helpers -------------
 
     def _build_url(self, plane: PVPlane) -> str:
-        # Use time=utc to get canonical timestamps, then convert to system local time ourselves.
-        lat = _fmt_float(plane.latitude)
-        lon = _fmt_float(plane.longitude)
-        dec = _fmt_float(plane.dec_deg)
-        az = _fmt_float(plane.az_deg)
-        kwp = _fmt_float(plane.kwp)
-        return f"{self.BASE_URL}/estimate/{lat}/{lon}/{dec}/{az}/{kwp}?time=utc"
+        # Always request UTC to ensure consistent baseline
+        return f"{self.BASE_URL}/{plane.latitude}/{plane.longitude}/{plane.dec_deg}/{plane.az_deg}/{plane.kwp}?time=utc"
 
-
-def _fmt_float(v: float) -> str:
-    return f"{float(v):.6f}".rstrip("0").rstrip(".")
-
-def _safe_int(v: Any) -> Optional[int]:
-    try:
-        return int(v) if v is not None else None
-    except Exception:
-        return None
-
-def _get_local_tz():
-    return datetime.now().astimezone().tzinfo
-
-def _normalize_utc_series_to_local(series: Dict[str, Any]) -> Dict[str, float]:
-    """
-    Provider returned UTC timestamps (due to ?time=utc), possibly with 'T' and timezone suffix.
-    Convert each key to local system time "YYYY-MM-DD HH:MM".
-    """
-    out: Dict[str, float] = {}
-    if not series:
-        return out
-    local_tz = _get_local_tz()
-    for ts, val in series.items():
-        s = (ts or "").strip()
-        if not s:
-            continue
-        s = s.replace("Z", "+00:00")
-        if " " in s and "T" not in s:
-            s = s.replace(" ", "T")
-        try:
-            dt_utc = datetime.fromisoformat(s)
-        except Exception:
-            # Try padding seconds if missing
+    def _system_local_tz(self):
+        # Fallback for platforms without zoneinfo config
+        if ZoneInfo:
             try:
-                if len(s) == 16:  # YYYY-MM-DDTHH:MM
-                    dt_utc = datetime.fromisoformat(s + ":00")
-                else:
-                    # As last resort keep the original ts (trimmed) as key
-                    out[(ts[:16] if len(ts) >= 16 else ts).replace("T", " ")] = float(val)
-                    continue
+                # Attempt to detect via /etc/localtime symlink (zoneinfo usually handles this automatically)
+                return ZoneInfo(time.tzname[0])
             except Exception:
-                out[(ts[:16] if len(ts) >= 16 else ts).replace("T", " ")] = float(val)
-                continue
+                pass
+        # Ultimate fallback: fixed offset (NOT DST-aware). Better to warn.
+        offset_sec = -time.timezone
+        if time.daylight and time.localtime().tm_isdst == 1:
+            offset_sec = -time.altzone
+        sign = "+" if offset_sec >= 0 else "-"
+        hh = abs(offset_sec) // 3600
+        mm = (abs(offset_sec) % 3600) // 60
+        log.warning("Falling back to fixed-offset local timezone; DST changes will not be reflected.")
+        return timezone(datetime.strptime(f"{sign}{hh:02d}{mm:02d}", "%z").tzinfo.utcoffset(None))
 
-        # Ensure timezone-aware UTC
-        if dt_utc.tzinfo is None:
-            # Treat naive as UTC since API guaranteed utc
-            from datetime import timezone
-            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-
-        dt_local = dt_utc.astimezone(local_tz)
-        key = dt_local.strftime("%Y-%m-%d %H:%M")
-        out[key] = float(val)
-    return out
-
-def _normalize_day_keys_no_tzshift(day_series: Dict[str, Any]) -> Dict[str, float]:
-    """
-    Ensure day keys are 'YYYY-MM-DD'. Do NOT shift by timezone; preserve provider's day grouping.
-    """
-    out: Dict[str, float] = {}
-    for k, v in (day_series or {}).items():
+    def _rate_limit_error(self, resp: requests.Response) -> ForecastSolarRateLimitError:
         try:
-            d = datetime.fromisoformat(str(k)).date()
-            out[d.isoformat()] = float(v)
+            data = resp.json()
         except Exception:
-            out[str(k)] = float(v)
-    return out
+            data = {}
+        rl = data.get("ratelimit", {})
+        return ForecastSolarRateLimitError(
+            f"Rate limit exceeded ({rl})",
+            period=rl.get("period"),
+            limit=rl.get("limit"),
+            remaining=rl.get("remaining")
+        )
+
+    def _parse_ts_utc(self, ts: str) -> datetime:
+        """
+        Parse an ISO8601 timestamp that SHOULD include an offset (+00:00).
+        Returns an aware UTC datetime.
+        """
+        try:
+            dt = datetime.fromisoformat(ts)
+        except ValueError:
+            # Fallback: remove trailing Z if present
+            if ts.endswith("Z"):
+                dt = datetime.fromisoformat(ts[:-1])
+            else:
+                raise
+        if dt.tzinfo is None:
+            # Assume UTC if missing
+            dt = dt.replace(tzinfo=timezone.utc)
+        # Normalize to pure UTC zone (in case offset isn't +00:00)
+        return dt.astimezone(timezone.utc)
+
+    def _ts_local_key(self, dt_utc: datetime) -> str:
+        """
+        Convert aware UTC datetime to local and format minute-truncated key.
+        """
+        dt_local = dt_utc.astimezone(self.local_tz).replace(second=0, microsecond=0)
+        return dt_local.strftime("%Y-%m-%d %H:%M")
+
+    def _normalize_series(self, series: Dict[str, Any]) -> Dict[str, float]:
+        """
+        Generic normalization for any time-keyed numeric series.
+        - Parses keys as UTC
+        - Converts to local
+        - Truncates to minute
+        - Optionally filters to whole hours
+        - If multiple points collapse to same local minute (rare), later value overwrites.
+        """
+        out: Dict[str, float] = {}
+        for raw_ts, val in series.items():
+            try:
+                dt_utc = self._parse_ts_utc(raw_ts)
+            except Exception:
+                continue
+            if not self.keep_instantaneous:
+                # Keep only whole hours (minute=0, second=0)
+                if not (dt_utc.minute == 0 and dt_utc.second == 0):
+                    continue
+            key = self._ts_local_key(dt_utc)
+            try:
+                out[key] = float(val)
+            except Exception:
+                pass
+        return dict(sorted(out.items()))
+
+    def _aggregate_local_days(self, watts_wh: Dict[str, float]) -> Dict[str, float]:
+        """
+        Rebuild local-day totals from local timestamped watt_hours (cumulative or per period).
+        Expects keys "YYYY-MM-DD HH:MM" already local.
+        If watt_hours is cumulative (ever-increasing per API within each day), we compute per-day max.
+        If it's per-interval, we just sum. Forecast.Solar's 'watt_hours' is cumulative across entire horizon;
+        safer approach: sum watt_hours_period per local day if available. We'll handle that logic outside.
+        """
+        day_totals: Dict[str, float] = {}
+        for ts, wh in watts_wh.items():
+            day = ts[:10]
+            day_totals[day] = max(day_totals.get(day, 0.0), wh)
+        return dict(sorted(day_totals.items()))
+
+    def _sum_period_local_days(self, wh_period: Dict[str, float]) -> Dict[str, float]:
+        """
+        For watt_hours_period (per-interval Wh), aggregate by local date (sum).
+        """
+        day_totals: Dict[str, float] = {}
+        for ts, wh in wh_period.items():
+            day = ts[:10]
+            day_totals[day] = day_totals.get(day, 0.0) + wh
+        return dict(sorted(day_totals.items()))
+
+    def _normalize_payload(self, payload: Dict[str, Any]) -> ForecastSolarEstimate:
+        """
+        Transform raw Forecast.Solar payload into local-time keyed series.
+        """
+        result = payload.get("result", {}) or {}
+
+        # Extract raw series
+        raw_watts = result.get("watts", {}) or {}
+        raw_wh_period = result.get("watt_hours_period", {}) or {}
+        raw_wh_cumulative = result.get("watt_hours", {}) or {}
+        raw_wh_day_api = result.get("watt_hours_day", {}) or {}
+
+        # Normalize time series to local
+        watts_local = self._normalize_series(raw_watts)
+        wh_period_local = self._normalize_series(raw_wh_period)
+        wh_cum_local = self._normalize_series(raw_wh_cumulative)
+
+        # Rebuild local-day totals (prefer per-period sum if available for accuracy)
+        if wh_period_local:
+            wh_day_local = self._sum_period_local_days(wh_period_local)
+        else:
+            # Fall back to max cumulative per local day
+            wh_day_local = self._aggregate_local_days(wh_cum_local)
+
+        # Timezone info from API (might differ; we still base on UTC request)
+        api_tz = result.get("timezone")
+        api_time_utc = result.get("time")  # e.g., "2025-08-12T05:00:00+00:00"
+        if isinstance(api_time_utc, str):
+            try:
+                dt_api_utc = self._parse_ts_utc(api_time_utc)
+                time_local_fmt = self._ts_local_key(dt_api_utc)
+            except Exception:
+                dt_api_utc = None
+                time_local_fmt = None
+        else:
+            dt_api_utc = None
+            time_local_fmt = None
+
+        # Rate limit
+        rl_raw = payload.get("ratelimit", {}) or {}
+        ratelimit = RateLimitInfo(
+            zone=rl_raw.get("zone"),
+            period=rl_raw.get("period"),
+            limit=rl_raw.get("limit"),
+            remaining=rl_raw.get("remaining"),
+        )
+
+        estimate = ForecastSolarEstimate(
+            watts=watts_local,
+            watt_hours_period=wh_period_local,
+            watt_hours=wh_cum_local,
+            watt_hours_day=wh_day_local,
+            timezone=api_tz,
+            time_local=time_local_fmt,
+            time_utc=api_time_utc,
+            ratelimit=ratelimit,
+            raw_payload=payload
+        )
+        return estimate

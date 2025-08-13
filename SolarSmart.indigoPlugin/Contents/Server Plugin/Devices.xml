@@ -453,7 +453,41 @@
       <TriggerLabel>Remaining quota changed</TriggerLabel>
       <ControlPageLabel>Remaining quota (min)</ControlPageLabel>
     </State>
-
+<State id="catchupActive">
+  <ValueType>Boolean</ValueType>
+  <TriggerLabel>Catch-up active changed</TriggerLabel>
+  <ControlPageLabel>Catch-up Active</ControlPageLabel>
+</State>
+<State id="catchupRunTodayMins">
+  <ValueType>Integer</ValueType>
+  <TriggerLabel>Catch-up run today changed</TriggerLabel>
+  <ControlPageLabel>Catch-up Run Today (mins)</ControlPageLabel>
+</State>
+<State id="catchupDailyTargetMins">
+  <ValueType>Integer</ValueType>
+  <TriggerLabel>Catch-up daily target changed</TriggerLabel>
+  <ControlPageLabel>Catch-up Daily Target (mins)</ControlPageLabel>
+</State>
+<State id="catchupRemainingTodayMins">
+  <ValueType>Integer</ValueType>
+  <TriggerLabel>Catch-up remaining today changed</TriggerLabel>
+  <ControlPageLabel>Catch-up Remaining Today (mins)</ControlPageLabel>
+</State>
+<State id="catchupRunWindowAccumMins">
+  <ValueType>Integer</ValueType>
+  <TriggerLabel>Catch-up window accumulated changed</TriggerLabel>
+  <ControlPageLabel>Catch-up Window Accum (mins)</ControlPageLabel>
+</State>
+<State id="catchupLastStart">
+  <ValueType>String</ValueType>
+  <TriggerLabel>Catch-up last start changed</TriggerLabel>
+  <ControlPageLabel>Catch-up Last Start</ControlPageLabel>
+</State>
+<State id="catchupLastStop">
+  <ValueType>String</ValueType>
+  <TriggerLabel>Catch-up last stop changed</TriggerLabel>
+  <ControlPageLabel>Catch-up Last Stop</ControlPageLabel>
+</State>
     <State id="LastReason">
       <ValueType>String</ValueType>
       <TriggerLabel>Last decision reason changed</TriggerLabel>
