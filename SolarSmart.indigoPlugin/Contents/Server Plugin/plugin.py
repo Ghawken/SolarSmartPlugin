@@ -430,7 +430,6 @@ class SolarSmartAsyncManager:
         if getattr(self.plugin, "debug2", False):
             self.plugin.logger.debug("_ticker_main_states: exiting (stopThread set)")
 
-# REPLACE the whole _catchup_scheduler with the version below
 
     def _parse_hhmm(self, s: str) -> dtime:
         s = (s or "").strip()
@@ -487,29 +486,39 @@ class SolarSmartAsyncManager:
 
         return runtime_secs >= (min_runtime_mins * 60.0)
 
+        # 1. In SolarSmartAsyncManager._catchup_deficit_scheduler REPLACE the entire function body with this simpler logic:
+
     def _catchup_deficit_scheduler(self, loads_by_tier: dict[int, list[indigo.Device]]):
         """
-        Daily Deficit Catch-up Scheduler (Option A)
+        Fallback Catch-up Scheduler (quota-window based) with detailed debug5 tracing.
 
-        For each enabled load with enableCatchup:
-          - Maintain per-day runtime seconds (st["run_today_secs"]) (accrued in _accrue_runtime_for_running_loads).
-          - Daily target (minutes) = max(minRuntimeMins, catchupRuntimeMins).
-          - Deficit = target - run_today_minutes.
-          - If deficit > 0 and inside catch-up window AND load is OFF AND concurrency allows,
-              start it (mark st["catchup_active"]=True, update catchupActive state).
-          - If catch-up started this load (catchup_active True) and (deficit <= 0 OR outside window),
-              stop it (Reason accordingly) and clear active flag.
-          - Loads started by normal headroom logic (catchup_active False) are never forced OFF here;
-            they simply contribute towards eliminating the deficit.
+        Semantics:
+          catchupRuntimeMins (device prop) = fallback minimum runtime required per QUOTA WINDOW.
+          served_quota_mins (rolling)      = total runtime already accrued this quota window.
+          remaining_fallback               = max(0, catchupRuntimeMins - served_quota_mins).
+
+          We only start a load (catchupActive=True) if:
+            - enableCatchup is True
+            - remaining_fallback > 0
+            - inside catch-up window
+            - device currently OFF
+            - concurrency limit not exceeded
+            - (optional) per-tick start cap not exceeded
+
+          If catchupActive and (remaining_fallback == 0 OR window closed) we stop it.
+
+          If the device is already ON for other reasons, we DO NOT toggle catchupActive;
+          its runtime still reduces the fallback remaining naturally.
 
         States updated each tick:
-            catchupDailyTargetMins
-            catchupRunTodayMins
-            catchupRemainingTodayMins
-            catchupActive
-            catchupRunWindowAccumMins (mirrors runToday for now)
+          catchupDailyTargetMins       = configured catchupRuntimeMins (dup for Control Pages)
+          catchupRemainingTodayMins    = remaining_fallback
+          catchupRunTodayMins          = minutes of runtime under catchupActive
+          catchupRunWindowAccumMins    = mirrors catchupRunTodayMins (placeholder)
+          catchupActive                = True only if we started it for fallback
+          catchupLastStart / LastStop  = timestamps of catch-up driven transitions
         """
-        dbg = getattr(self.plugin, "debug2", False)
+        dbg5 = getattr(self.plugin, "debug6", False)
         now = datetime.now()
         now_t = now.time()
 
@@ -521,136 +530,193 @@ class SolarSmartAsyncManager:
                 if self._is_running(d):
                     running_now += 1
 
-        catchup_starts_this_tick = 0  # limit to 1 catch-up driven start per tick (optional)
+        if dbg5:
+            self.plugin.logger.debug(
+                f"[CATCHUP][TICK] start at {now.strftime('%H:%M:%S')} "
+                f"maxConc={max_concurrent} runningNow={running_now}"
+            )
+
+        catchup_starts_this_tick = 0
+        total_devices = 0
+        total_candidates = 0
+        total_active = 0
+        total_started = 0
+        total_stopped = 0
+        total_skipped = 0
+        total_satisfied = 0
 
         for tier, devs in loads_by_tier.items():
             for d in devs:
+                if d.deviceTypeId != "solarsmartLoad" or not d.enabled:
+                    continue
+                total_devices += 1
                 try:
-                    if d.deviceTypeId != "solarsmartLoad" or not d.enabled:
-                        continue
                     props = d.pluginProps or {}
                     if not bool(props.get("enableCatchup", False)):
-                        # Ensure inactive flag if previously active
+                        # Clear stale active flag
                         st = self.plugin._load_state.setdefault(d.id, {})
+                        if dbg5:
+                            self.plugin.logger.debug(f"[CATCHUP][SKIP-NOFLAG] {d.name}: enableCatchup=False")
                         if st.get("catchup_active"):
+                            if dbg5:
+                                self.plugin.logger.debug(f"[CATCHUP] {d.name}: disabling catchupActive (prop disabled)")
                             st["catchup_active"] = False
                             d.updateStateOnServer("catchupActive", False)
                         continue
 
                     st = self.plugin._load_state.setdefault(d.id, {})
+                    if "catchup_run_secs" not in st:
+                        st["catchup_run_secs"] = 0.0
 
-                    # Establish today's key (set in accrual too, but be defensive)
-                    today_key = now.strftime("%Y-%m-%d")
-                    if st.get("today_key") != today_key:
-                        # Daily rollover not caught yet (should normally be handled in accrual)
-                        st["today_key"] = today_key
-                        st["run_today_secs"] = 0
-                        # Do not forcibly stop the device here; leave that to shed logic unless it was catchup_active
-                        if st.get("catchup_active"):
-                            st["catchup_active"] = False
-                            d.updateStateOnServer("catchupActive", False)
-
-                    run_today_secs = float(st.get("run_today_secs", 0.0))
-                    run_today_mins = int(run_today_secs // 60)
-
-                    # Configured mins
-                    try:
-                        min_runtime = int(props.get("minRuntimeMins") or 0)
-                    except Exception:
-                        min_runtime = 0
+                    # Config target
                     try:
                         catchup_runtime = int(props.get("catchupRuntimeMins") or 0)
                     except Exception:
                         catchup_runtime = 0
 
-                    # Daily target semantics (Option A):
-                    # Guarantee at least the larger of minRuntimeMins and catchupRuntimeMins.
-                    daily_target = max(min_runtime, catchup_runtime)
+                    d.updateStateOnServer("catchupDailyTargetMins", catchup_runtime)
 
-                    if daily_target <= 0:
-                        # Nothing to do but clear flags
+                    if catchup_runtime <= 0:
+                        # Target is zero; publish zeros & clear flag
                         if st.get("catchup_active"):
                             st["catchup_active"] = False
                             d.updateStateOnServer("catchupActive", False)
-                        # Update states to zeros for clarity
-                        d.updateStateOnServer("catchupDailyTargetMins", 0)
-                        d.updateStateOnServer("catchupRunTodayMins", run_today_mins)
+                        run_cu_mins = int(float(st.get("catchup_run_secs", 0.0)) // 60)
                         d.updateStateOnServer("catchupRemainingTodayMins", 0)
-                        d.updateStateOnServer("catchupRunWindowAccumMins", run_today_mins)
+                        d.updateStateOnServer("catchupRunTodayMins", run_cu_mins)
+                        d.updateStateOnServer("catchupRunWindowAccumMins", run_cu_mins)
+                        if dbg5:
+                            self.plugin.logger.debug(f"[CATCHUP] {d.name}: target=0 → nothing required")
                         continue
 
-                    deficit = daily_target - run_today_mins
-                    if deficit < 0:
-                        deficit = 0  # clamp
+                    served = self._served_quota_mins(d)
+                    remaining_fallback = max(0, catchup_runtime - served)
 
-                    # Catch-up window
                     start_t = self._parse_hhmm(props.get("catchupWindowStart", "00:00"))
                     end_t = self._parse_hhmm(props.get("catchupWindowEnd", "06:00"))
                     in_window = self._time_in_window(now_t, start_t, end_t)
-
                     active = bool(st.get("catchup_active"))
                     is_running = self._is_running(d)
 
-                    # Update states early (reflect current progress before start/stop decisions)
-                    d.updateStateOnServer("catchupDailyTargetMins", daily_target)
-                    d.updateStateOnServer("catchupRunTodayMins", run_today_mins)
-                    d.updateStateOnServer("catchupRemainingTodayMins", deficit)
-                    d.updateStateOnServer("catchupRunWindowAccumMins", run_today_mins)
+                    catchup_run_mins = int(float(st.get("catchup_run_secs", 0.0)) // 60)
+                    d.updateStateOnServer("catchupRemainingTodayMins", remaining_fallback)
+                    d.updateStateOnServer("catchupRunTodayMins", catchup_run_mins)
+                    d.updateStateOnServer("catchupRunWindowAccumMins", catchup_run_mins)
                     d.updateStateOnServer("catchupActive", active)
 
-                    # STOP condition (if we started it for catch-up)
+                    total_candidates += 1
+                    if active:
+                        total_active += 1
+
+                    if dbg5:
+                        self.plugin.logger.debug(
+                            f"[CATCHUP][EVAL] {d.name} tier={tier} served={served}m "
+                            f"target={catchup_runtime}m remaining={remaining_fallback}m "
+                            f"active={active} running={is_running} inWindow={in_window} "
+                            f"win={start_t.strftime('%H:%M')}-{end_t.strftime('%H:%M')} "
+                            f"catchupRun={catchup_run_mins}m"
+                        )
+
+                    # STOP logic (only if we started it)
                     if active and is_running:
-                        if deficit == 0:
-                            # Target reached
-                            self._ensure_off(d, "Catch-up target met")
+                        if remaining_fallback == 0:
+                            self._ensure_off(d, "Catch-up target satisfied")
                             st["catchup_active"] = False
                             d.updateStateOnServer("catchupActive", False)
-                            if dbg:
-                                self.plugin.logger.debug(f"[CATCHUP STOP] {d.name}: target met")
+                            d.updateStateOnServer("catchupLastStop", now.strftime("%Y-%m-%d %H:%M:%S"))
+                            total_stopped += 1
+                            total_satisfied += 1
+                            if dbg5:
+                                self.plugin.logger.debug(f"[CATCHUP][STOP] {d.name}: satisfied served={served}m")
                             continue
                         if not in_window:
-                            # Window closed
                             self._ensure_off(d, "Catch-up window closed")
                             st["catchup_active"] = False
                             d.updateStateOnServer("catchupActive", False)
-                            if dbg:
-                                self.plugin.logger.debug(f"[CATCHUP STOP] {d.name}: window closed (remaining {deficit}m)")
+                            d.updateStateOnServer("catchupLastStop", now.strftime("%Y-%m-%d %H:%M:%S"))
+                            total_stopped += 1
+                            if dbg5:
+                                self.plugin.logger.debug(
+                                    f"[CATCHUP][STOP] {d.name}: window closed remaining={remaining_fallback}m"
+                                )
                             continue
-                        # Else still deficit & in window: keep running (do nothing)
-                        continue
-
-                    # Already running but NOT catchup_active: just accrue; deficit will drop naturally
-                    if is_running and not active:
-                        # Optionally, if deficit == 0 and we wanted to stop loads that only run beyond their
-                        # minRuntime, we could add logic, but that's handled elsewhere (quota/headroom).
-                        continue
-
-                    # Not running and not active: decide whether to start for catch-up
-                    if deficit > 0 and in_window:
-                        if running_now >= max_concurrent:
-                            if dbg:
-                                self.plugin.logger.debug(f"[CATCHUP SKIP] {d.name}: concurrency cap reached")
-                            continue
-                        if catchup_starts_this_tick >= 1:
-                            if dbg:
-                                self.plugin.logger.debug(f"[CATCHUP SKIP] {d.name}: per-tick catch-up start cap")
-                            continue
-                        # Start for catch-up
-                        self._ensure_on(d, f"Catch-up start (need {deficit}m)")
-                        st["catchup_active"] = True
-                        d.updateStateOnServer("catchupActive", True)
-                        running_now += 1
-                        catchup_starts_this_tick += 1
-                        if dbg:
+                        # Still running & needed
+                        if dbg5:
                             self.plugin.logger.debug(
-                                f"[CATCHUP START] {d.name}: deficit={deficit}m target={daily_target}m window {start_t.strftime('%H:%M')}-{end_t.strftime('%H:%M')}"
+                                f"[CATCHUP][KEEP] {d.name}: remaining={remaining_fallback}m (window open)"
                             )
-                    else:
-                        # Either no deficit or outside window: nothing to do
-                        pass
+                        continue
+
+                    # Natural runtime (ON but not catchupActive)
+                    if is_running and not active:
+                        if remaining_fallback == 0 and dbg5:
+                            self.plugin.logger.debug(
+                                f"[CATCHUP][PASSIVE-SAT] {d.name}: already met fallback via normal runtime"
+                            )
+                            total_satisfied += 1
+                        elif dbg5:
+                            self.plugin.logger.debug(
+                                f"[CATCHUP][PASSIVE] {d.name}: running normally; remaining={remaining_fallback}m"
+                            )
+                        continue
+
+                    # OFF scenarios
+                    if remaining_fallback == 0:
+                        total_satisfied += 1
+                        if dbg5:
+                            self.plugin.logger.debug(
+                                f"[CATCHUP][NO-NEED] {d.name}: fallback already met; no start."
+                            )
+                        continue
+
+                    if not in_window:
+                        total_skipped += 1
+                        if dbg5:
+                            self.plugin.logger.debug(
+                                f"[CATCHUP][SKIP] {d.name}: outside window remaining={remaining_fallback}m"
+                            )
+                        continue
+
+                    if running_now >= max_concurrent:
+                        total_skipped += 1
+                        if dbg5:
+                            self.plugin.logger.debug(
+                                f"[CATCHUP][SKIP] {d.name}: concurrency cap ({running_now}/{max_concurrent})"
+                            )
+                        continue
+
+                    if catchup_starts_this_tick >= 1:
+                        total_skipped += 1
+                        if dbg5:
+                            self.plugin.logger.debug(
+                                f"[CATCHUP][SKIP] {d.name}: per-tick catch-up start cap reached"
+                            )
+                        continue
+
+                    # START for catch-up
+                    self._ensure_on(d, f"Catch-up start (need {remaining_fallback}m)")
+                    st["catchup_active"] = True
+                    d.updateStateOnServer("catchupActive", True)
+                    d.updateStateOnServer("catchupLastStart", now.strftime("%Y-%m-%d %H:%M:%S"))
+                    running_now += 1
+                    catchup_starts_this_tick += 1
+                    total_started += 1
+                    if dbg5:
+                        self.plugin.logger.debug(
+                            f"[CATCHUP][START] {d.name}: remaining={remaining_fallback}m "
+                            f"served={served}m target={catchup_runtime}m"
+                        )
 
                 except Exception as e:
-                    self.plugin.logger.exception(f"_catchup_deficit_scheduler: error on '{d.name}': {e}")
+                    self.plugin.logger.exception(f"_catchup_deficit_scheduler error on {d.name}: {e}")
+
+        if dbg5:
+            self.plugin.logger.debug(
+                "[CATCHUP][TICK-END] devices=%d candidates=%d active=%d started=%d stopped=%d "
+                "skipped=%d satisfied=%d runningNow=%d" %
+                (total_devices, total_candidates, total_active, total_started,
+                 total_stopped, total_skipped, total_satisfied, running_now)
+            )
 
     def _shed_all(self, reason: str, tiers: set[int] | None = None):
         """
@@ -789,11 +855,18 @@ class SolarSmartAsyncManager:
             except Exception:
                 pass
 
-            # 3. Daily seconds
+            # 3. Daily seconds (still maintained if you want daily analytics)
             try:
                 st["run_today_secs"] = float(st.get("run_today_secs", 0.0)) + add_s
             except Exception:
                 st["run_today_secs"] = add_s
+
+            # 3b. Catch-up active runtime seconds (fallback minutes actually run under catch-up)
+            if st.get("catchup_active"):
+                try:
+                    st["catchup_run_secs"] = float(st.get("catchup_run_secs", 0.0)) + add_s
+                except Exception:
+                    st["catchup_run_secs"] = add_s
 
             # 4. Refresh RemainingQuotaMins
             self._quota_remaining_mins(dev, props, datetime.now())
@@ -1158,7 +1231,15 @@ class SolarSmartAsyncManager:
             # Reset served quota to 0 for the new window
             st["served_quota_mins"] = 0
             dev.updateStateOnServer("RuntimeQuotaMins", 0)
-
+            # Reset catch-up run accumulation for new quota window
+            st["catchup_run_secs"] = 0.0
+            try:
+                dev.updateStateOnServer("catchupRunTodayMins", 0)
+                dev.updateStateOnServer("catchupRunWindowAccumMins", 0)
+                # Recompute remaining fallback (will be full target again)
+                dev.updateStateOnServer("catchupRemainingTodayMins", 0)  # will be recalculated next scheduler tick
+            except Exception:
+                pass
             # Recompute remaining from device props
             target = int(props.get("maxRuntimePerQuotaMins") or 0)
             remaining = max(0, target)
@@ -1724,8 +1805,9 @@ class SolarSmartAsyncManager:
                 dev.updateStateOnServer("LastReason", reason)
                 return
 
-            # fire the action group
-            self.plugin._execute_load_action(dev, turn_on=True, reason=reason)
+            # If not marked as runningfire the action group
+            else:
+                self.plugin._execute_load_action(dev, turn_on=True, reason=reason)
 
             # mark running NOW (don’t wait for external device feedback)
             st = self.plugin._load_state.setdefault(dev.id, {})
@@ -1773,7 +1855,7 @@ class SolarSmartAsyncManager:
 
             # Execute OFF and clear flags
             st = self.plugin._load_state.setdefault(dev.id, {})
-            self.plugin._execute_load_action(dev, turn_on=False, reason=reason)
+            ##  Only do above otherwise sent everytimg self.plugin._execute_load_action(dev, turn_on=False, reason=reason)
             ran_secs = None
             if st.get("start_ts"):
                 try:
@@ -2394,6 +2476,12 @@ class Plugin(indigo.PluginBase):
                 # Only set LastReason if empty to avoid clobbering recent info
                 if not dev.states.get("LastReason"):
                     dev.updateStateOnServer("LastReason", "Plugin restart recovery")
+
+            try:
+                cur_cu_run = int(dev.states.get("catchupRunTodayMins", 0) or 0)
+                st.setdefault("catchup_run_secs", cur_cu_run * 60)
+            except Exception:
+                pass
 
             if getattr(self, "debug2", False):
                 self.logger.debug(

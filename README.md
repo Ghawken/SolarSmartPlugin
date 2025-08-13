@@ -194,6 +194,260 @@ Note: Field names may vary slightly by version.
 
 ---
 
+## 1. Scheduled Catch‑Up (Fallback Runtime)
+
+### What Problem Does Catch‑Up Solve?
+
+Some devices (pool pumps, chlorinators, ventilation fans, etc.) must run a **minimum amount of time** each quota window (e.g. per day or rolling window) regardless of how much excess solar was actually available.  
+Scheduled Catch‑Up guarantees a fallback runtime:
+
+- If the device already ran enough minutes naturally (because there was plenty of solar), catch‑up does **nothing**.
+- If it did **not** reach the fallback target, the plugin will force it ON during your defined “catch‑up window” (often overnight / off‑peak) until the shortfall is eliminated.
+
+### Key Concepts (Plain English)
+
+| Term | Meaning |
+|------|---------|
+| Catch‑up Runtime (mins) | The fallback minimum you want the load to achieve during the current quota window. |
+| Served (RuntimeQuotaMins) | Total minutes the load has already run this quota window (any reason). |
+| Remaining Fallback | catchupRuntimeMins − served (never below 0). |
+| catchupActive | True only while the plugin forcibly runs the load to make up the deficit. |
+| Concurrency | Obeys the “Max Concurrent Loads” setting on the Main device. |
+
+### Life Cycle Example
+
+| Scenario | Result |
+|----------|--------|
+| Fallback set to 120 min. Load already ran 155 min naturally. | No catch‑up needed (Remaining Fallback = 0). |
+| Fallback = 180 min. Load ran only 70 min by window start. | Remaining Fallback = 110 → plugin forces ON in catch‑up window until +110 min accumulated. |
+| Fallback = 60 min. Device has run 0 min. Window opens. | Plugin starts it (catchupActive = true). |
+| While catch‑up running headroom goes negative. | Catch‑up continues (it ignores headroom) unless concurrency or you manually stop it. |
+| Target reached (Remaining Fallback = 0) before window end. | Plugin stops the load; catchupActive = false. |
+| Window closes with Remaining Fallback > 0. | Plugin stops the load; will try again next catch‑up window if still within quota window. |
+
+### How to Enable Catch‑Up
+
+1. Open the SmartSolar Load device (Devices.xml type: `solarsmartLoad`).
+2. Check “Enable Scheduled Catch‑up”.
+3. Set:
+   - Catch‑up Runtime (mins) – your fallback target (e.g. 120).
+   - Catch‑up Window Start / End – off‑peak hours (e.g. 00:00 → 06:00).
+4. (Optional) Adjust Max Concurrent Loads on the SolarSmart Main device.
+5. Save. Wait a scheduler tick (default ~60 seconds) or enable high debug to watch immediately.
+
+### What Triggers a Catch‑Up Start?
+
+All must be true:
+- `enableCatchup` is checked.
+- `catchupRuntimeMins` > 0.
+- Remaining Fallback > 0.
+- Device is currently OFF.
+- Current time is inside the defined catch‑up window.
+- Concurrency limit not exceeded.
+- Only one catch‑up start per tick (internal safety throttle).
+
+### Stopping Conditions for Catch‑Up
+
+Catch‑up started device stops when:
+- Remaining Fallback = 0 (target satisfied), **or**
+- Current time exits the catch‑up window, **or**
+- You manually turn it OFF, **or**
+- Quota window rolls over (the runtime counters reset), **or**
+- Plugin / Indigo restarts (it re‑evaluates next tick).
+
+### Important Device States (SmartSolar Load)
+
+| State | Description |
+|-------|-------------|
+| `catchupDailyTargetMins` | Exactly the configured fallback (Catch‑up Runtime). |
+| `catchupRemainingTodayMins` | Minutes still needed to satisfy fallback (never negative). |
+| `catchupActive` | True only while **plugin‑forced** catch‑up run is in progress. |
+| `catchupRunTodayMins` | Minutes accumulated under catch‑up active time only. |
+| `catchupRunWindowAccumMins` | Mirrors `catchupRunTodayMins` (placeholder). |
+| `catchupLastStart` / `catchupLastStop` | Time stamps (YYYY‑MM‑DD HH:MM:SS) when catch‑up run last began/ended. |
+| `RuntimeQuotaMins` | Total runtime this quota window (all causes). |
+| `RemainingQuotaMins` | Remaining regular (non‑fallback) quota minutes if a max is configured. |
+
+### Typical Control Page Elements
+
+- Fallback Target: `catchupDailyTargetMins`
+- Fallback Remaining: `catchupRemainingTodayMins`
+- Active Indicator: `catchupActive`
+- Last Start / Last Stop
+- Total Quota Runtime: `RuntimeQuotaMins`
+
+### Why Isn’t It Starting?
+
+| Check | Reason |
+|-------|--------|
+| `enableCatchup` unchecked | Feature disabled. |
+| `catchupRuntimeMins` = 0 | No fallback required. |
+| Remaining Fallback = 0 | Already satisfied by normal runtime. |
+| Outside catch‑up window | Wait until window start. |
+| Concurrency limit reached | Another load occupies a slot. |
+| Start throttle | One catch‑up start already happened this tick. |
+| Not enough time passed | Wait for the next scheduler interval. |
+
+### Logging (Deep Diagnostics)
+
+Turn on `debug5` (in plugin preferences) to see lines like:
+
+```
+[CATCHUP][EVAL] LoadName tier=1 served=70m target=180m remaining=110m ...
+[CATCHUP][START] LoadName: remaining=110m ...
+[CATCHUP][KEEP] ...
+[CATCHUP][STOP] ...
+[CATCHUP][NO-NEED] ...
+```
+
+A summary line at tick end shows total candidates, starts, stops, and satisfied loads.
+
+---
+
+## 2. Solar Forecast (forecast.solar Integration)
+
+### Purpose
+
+Estimate today’s and tomorrow’s PV generation so you can:
+- Pre‑run discretionary loads if tomorrow looks poor.
+- Time energy‑intensive tasks near the forecast peak.
+- Show production expectations on Indigo Control Pages.
+
+### How It Works
+
+1. Reads latitude & longitude from Indigo server settings.
+2. Queries `forecast.solar` with:
+   - Tilt (declination)
+   - Azimuth (orientation)
+   - System size (kWp)
+3. Normalizes all timestamps to your local timezone.
+4. Summarizes per LOCAL day:
+   - Total kWh
+   - Peak kW & peak time
+5. Caches raw JSON for 1 hour (file per Main device) to respect API rate limits.
+6. Background thread wakes every 10 minutes:
+   - Uses cache if < 1 hour old
+   - Fetches new data otherwise
+7. If rate limited (HTTP 429), logs info and reuses last cached result.
+
+### Enabling the Forecast
+
+1. Open the SolarSmart Main device.
+2. Check “Enable Solar Forecast (forecast.solar)”.
+3. Set (or accept defaults):
+   - Panel Tilt / Declination (deg)
+   - Panel Azimuth (see below)
+   - System Size (kWp DC)
+4. Save. Within a minute (or sooner if cache valid) forecast states appear.
+
+### Azimuth (forecast.solar Convention)
+
+| Direction | Degrees |
+|-----------|---------|
+| South | 0 |
+| West | 90 |
+| North | 180 |
+| East | 270 (you may also supply -90) |
+
+### Key Main Device States
+
+| State | Description |
+|-------|-------------|
+| `forecastTodayDate` / `forecastTomorrowDate` | Local date keys (YYYY‑MM‑DD). |
+| `forecastTodayKWh` / `forecastTomorrowKWh` | Daily production estimate in kWh (stringified float). |
+| `forecastPeakKWToday` / `forecastPeakKWTomorrow` | Peak instantaneous kW (float). |
+| `forecastPeakTimeToday` / `forecastPeakTimeTomorrow` | Local timestamp of strongest production (YYYY‑MM‑DD HH:MM). |
+| `forecastSolarSummary` | Comma‑separated daily totals (friendly format). |
+| `forecastSolarPeaks` | “Peaks: <time> = <kW>, …” summary. |
+
+### Cache Location
+
+`Preferences/Plugins/com.GlennNZ.indigoplugin.SmartSolar/forecast_main_<MainDeviceID>.json`
+
+(Contains the raw API payload including `ratelimit` info.)
+
+### Rate Limit Strategy
+
+| Behavior | Detail |
+|----------|--------|
+| Cache lifespan | 1 hour |
+| Thread wake interval | 10 minutes |
+| Network call frequency | At most once per hour (per Main device) |
+| Rate limit exceeded | Reuse last cached payload; log INFO message. |
+
+### Common Uses
+
+| Goal | Automation Idea |
+|------|-----------------|
+| Run flexible load before poor day | If `forecastTomorrowKWh < X` then increase today’s run time. |
+| Time EV / battery charge | Use `forecastPeakTimeToday` to schedule controlled ramp or preheat. |
+| Control Page forecast panel | Display `forecastSolarSummary` & `forecastSolarPeaks`. |
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| No forecast states | Ensure checkbox enabled; verify server location; check log for errors. |
+| Tomorrow values blank or 0 early | API sometimes populates later; will appear on next refresh. |
+| Data stale > 1h | Delete cache file to force early refetch or wait for next hourly expiry. |
+| Rate limit messages | Normal; plugin automatically falls back to cached data. |
+
+### Accuracy Tips
+
+- Set kWp to DC nameplate (sum of all panels).
+- Use correct tilt / azimuth for your physical array(s).
+- Forecast is weather‑model dependent: treat as planning guidance, not absolute truth.
+- If you have multiple arrays with very different azimuths, consider separate Main devices (one per array) if you need per‑plane breakdown (each gets its own cache file).
+
+### Example Control Page Layout (Simple)
+
+| Label | Linked State |
+|-------|--------------|
+| Today (kWh) | `forecastTodayKWh` |
+| Peak (kW @ time) | `forecastPeakKWToday` + `forecastPeakTimeToday` |
+| Tomorrow (kWh) | `forecastTomorrowKWh` |
+| Tomorrow Peak | `forecastPeakKWTomorrow` + `forecastPeakTimeTomorrow` |
+| Summary | `forecastSolarSummary` |
+| Peaks | `forecastSolarPeaks` |
+
+### Logging Levels
+
+| Level | Content |
+|-------|---------|
+| INFO | Rate limit notices, start/stop summaries. |
+| debug2 / debug3 | Cache hits/misses, normalization steps. |
+| debug (general) | Summaries and peak lines, truncated raw JSON. |
+
+---
+
+## Quick Reference Cheat Sheet
+
+| Task | Steps |
+|------|-------|
+| Guarantee pump runs at least 2h overnight if solar was poor | Set Catch‑up Runtime = 120, window = 00:00–06:00, enable catch‑up. |
+| Display today + tomorrow forecast on Control Page | Enable forecast, place `forecastSolarSummary` or individual states. |
+| Diagnose why catch‑up not starting | Enable `debug5`, check `[CATCHUP][EVAL]` lines & remaining fallback. |
+| Force fresh forecast fetch | Delete cache file or wait until >1h since last fetch. |
+| Limit simultaneous forced runs | Adjust “Max Concurrent Loads” on Main device. |
+
+---
+
+## FAQs
+
+**Q: Does catch‑up exceed my regular max runtime quota?**  
+A: Catch‑up counts toward the same served minutes. It won’t *ignore* your quota cap; if quota is exhausted the load becomes ineligible and catch‑up won’t start.
+
+**Q: Can a load be both normally running and catch‑up active?**  
+A: If it was already ON when deficit existed, it stays a “normal” run (catchupActive stays False). Catch‑up only marks ownership when it *starts* the load.
+
+**Q: Why is `catchupRunTodayMins` low even though fallback is satisfied?**  
+A: Those minutes count only plugin‑forced (active) time. Normal passive runtime still reduces `catchupRemainingTodayMins` but does not increment the “run under catch‑up” counter.
+
+**Q: Can I change azimuth to use traditional compass values (e.g. 180 = South)?**  
+A: forecast.solar uses 0=South; the plugin applies your entry directly. Enter values per its convention (documented above).
+
+---
+
 ## Logging and Diagnostics
 
 The plugin logs to Indigo’s Event Log with selectable verbosity.

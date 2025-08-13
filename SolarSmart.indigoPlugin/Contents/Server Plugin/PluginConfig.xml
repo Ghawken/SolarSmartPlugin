@@ -60,9 +60,9 @@ Shorter time risks devices on and off, longer time misses Solar changes</Label>
         <Description>5. Debug Async Solar Manager</Description>
     </Field>
 
-    <Field id="debug6" type="checkbox" hidden="True" tooltip="Enabling will .">
+    <Field id="debug6" type="checkbox" hidden="False" tooltip="Enabling will .">
         <Label/>
-        <Description>6. Debug 6</Description>
+        <Description>6. Debug Catchup Scheduler</Description>
     </Field>
 
     <Field id="debug7" type="checkbox" hidden="True"  tooltip="Enabling will .">
