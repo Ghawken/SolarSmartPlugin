@@ -453,6 +453,14 @@
       <TriggerLabel>Remaining quota changed</TriggerLabel>
       <ControlPageLabel>Remaining quota (min)</ControlPageLabel>
     </State>
+
+            <!-- >>> NEW: Percentage of quota runtime completed -->
+        <State id="RuntimeQuotaPct">
+          <ValueType>Integer</ValueType>
+          <TriggerLabel>Quota runtime percent changed</TriggerLabel>
+          <ControlPageLabel>Quota Runtime (%)</ControlPageLabel>
+        </State>
+        <!-- <<< NEW -->
 <State id="catchupActive">
   <ValueType>Boolean</ValueType>
   <TriggerLabel>Catch-up active changed</TriggerLabel>
