@@ -65,9 +65,9 @@ Shorter time risks devices on and off, longer time misses Solar changes</Label>
         <Description>6. Debug Catchup Scheduler</Description>
     </Field>
 
-    <Field id="debug7" type="checkbox" hidden="True"  tooltip="Enabling will .">
+    <Field id="debug7" type="checkbox" hidden="False"  tooltip="Enabling will .">
         <Label/>
-        <Description>7. Debug 7</Description>
+        <Description>7. Debug Internal Variables (Verbose)</Description>
     </Field>
 
     <Field id="debug8" type="checkbox" hidden="True"  tooltip="Enabling will .">

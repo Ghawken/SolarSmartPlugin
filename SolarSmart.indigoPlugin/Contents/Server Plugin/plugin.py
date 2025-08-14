@@ -144,6 +144,126 @@ class IndigoLogHandler(logging.Handler):
 ################################################################################
 # Async Smart Solar Class
 ################################################################################
+# ─────────────────────────────────────────────────────────────────────────────
+# INTERNAL RUNTIME / "QUOTA" / CATCH‑UP TERMINOLOGY (Documentation Only)
+# -----------------------------------------------------------------------------
+# NOTE: The code historically uses the word "quota". In practice this means:
+#   Preferred Runtime Window Allowance:
+#       A rolling allowance of minutes we *prefer* to accumulate during times
+#       of surplus solar (normal scheduler operation).
+#   Catch‑up:
+#       A fallback period (often off‑peak / night) where we run loads to reach
+#       a minimum desired runtime if solar surplus never allowed it earlier.
+#
+# We keep existing variable / state names for backward compatibility, but the
+# wording below clarifies intent.
+#
+# Core rolling window (“quota”) variables
+# ---------------------------------------
+# st["quota_anchor_ts"] / device state "QuotaAnchorTs"
+#   Epoch timestamp (float) marking the START of the current rolling preferred
+#   runtime window. When the configured window length elapses we "roll over":
+#   reset counters and advance this anchor to 'now' (or by whole windows).
+#
+# st["served_quota_mins"]  (mirrored to device state "RuntimeQuotaMins")
+#   Minutes of ON runtime accumulated *within the current rolling window*.
+#   This is the authoritative internal counter for "how much preferred runtime
+#   has been achieved this window".
+#
+# device state "RemainingQuotaMins"
+#   Remaining minutes still allowed / desired in the current rolling window:
+#       remaining = max(0, configured_max_per_window - served_quota_mins)
+#   When it reaches 0 the normal scheduler stops starting the load (unless
+#   already running and protected by min runtime), and we show SKIP (quota).
+#   At rollover it is refilled to the full configured max (not reset to 0).
+#
+# device state "RuntimeQuotaPct"
+#   Percentage (0–100) of the configured preferred window allowance already
+#   consumed: (served_quota_mins / configured_max) * 100 (clamped).
+#
+# device state "RuntimeWindowMins"
+#   Cosmetic counter shown in the table as "Time Run". Represents minutes the
+#   device has run since the *current quota window* started. Resets at window
+#   rollover (Option 1 fix ensures this now). It is not used for decisions.
+#
+# start_ts (in st["start_ts"])
+#   Epoch when the device was last turned ON by the scheduler. Used to enforce
+#   minimum runtime (so we don't stop too early).
+#
+# st["cooldown_start"]
+#   Epoch when the device was last turned OFF (for cooldown enforcement). Only
+#   populated if cooldown logic is active. Not always present.
+#
+# Daily / analytic counters
+# -------------------------
+# st["run_today_secs"]
+#   Seconds of runtime accumulated during the current *calendar day* (resets
+#   at local midnight). Independent of rolling window logic; used mainly for
+#   simplified analytics or potential daily policies.
+#
+# Catch‑up (“fallback runtime”) variables / states
+# -----------------------------------------------
+# Configuration props:
+#   enableCatchup (bool) – allow fallback logic.
+#   catchupRuntimeMins – minimum total minutes we want per window *or* per day
+#       (current implementation treats it as “per rolling window” target).
+#   catchupWindowStart / catchupWindowEnd – HH:MM window when fallback runs
+#       (often overnight / low tariff period).
+#
+# st["catchup_active"]  / device state "catchupActive"
+#   True only while the scheduler has explicitly started the device in the
+#   catch‑up window to recover missing preferred runtime. If the load is ON
+#   for normal reasons, catch‑up does not force this flag True.
+#
+# st["catchup_run_secs"]  (mirrored to "catchupRunTodayMins"/"catchupRunWindowAccumMins")
+#   Seconds the device has actually run *while catchup_active was True*. Lets
+#   you measure how much of the fallback runtime was truly “catch‑up driven”.
+#
+# device state "catchupDailyTargetMins"
+#   Copy of catchupRuntimeMins property (exposed for UI/control pages). Treated
+#   as the total desired minimum runtime for the rolling window (naming legacy).
+#
+# device state "catchupRemainingTodayMins"
+#   Computed fallback deficit: max(0, catchupDailyTargetMins - served_quota_mins).
+#   Even though the name says "Today", it currently measures the *rolling window*
+#   deficit, not strictly wall‑clock day. (Rename later if you change semantics.)
+#
+# device state "catchupRunTodayMins"
+#   Minutes accumulated under catch‑up (active) control in the current quota window
+#   (and resets when window rolls over and we zero catchup_run_secs).
+#
+# device state "catchupRunWindowAccumMins"
+#   Currently mirrors catchupRunTodayMins (placeholder if you later differentiate
+#   calendar day vs rolling window accumulation).
+#
+# device states "catchupLastStart" / "catchupLastStop"
+#   Human-friendly timestamps for when catch‑up mode last started / stopped.
+#
+# Interaction summary
+# -------------------
+# 1. Normal (preferred) operation increments served_quota_mins while solar allows.
+# 2. When served_quota_mins reaches configured max, RemainingQuotaMins hits 0 and
+#    scheduler will not START the load again inside that window (it may finish its
+#    current minimum runtime).
+# 3. At window rollover:
+#       served_quota_mins -> 0
+#       RemainingQuotaMins -> configured max
+#       RuntimeWindowMins -> 0 (after Option 1 fix)
+#       catchup_run_secs -> 0
+#    (Deficit may recalc next tick; catch-up flags cleared.)
+# 4. Catch‑up window: if served_quota_mins < catchupDailyTargetMins and other
+#    constraints OK, scheduler starts load, sets catchup_active=True, and tracks
+#    catchup_run_secs until deficit satisfied or window closes.
+#
+# Potential future naming cleanups (non-breaking ideas):
+#   RuntimeQuotaMins        -> PreferredRuntimeUsedMins
+#   RemainingQuotaMins      -> PreferredRuntimeRemainingMins
+#   catchupDailyTargetMins  -> FallbackTargetMins
+#   catchupRemainingTodayMins -> FallbackRemainingMins
+#   RuntimeWindowMins       -> PreferredWindowRunMins
+#
+# Until then, this block documents the current semantics unambiguously.
+# ─────────────────────────────────────────────────────────────────────────────
 class SolarSmartAsyncManager:
     """
     Owns the long-running async loops for SolarSmart.
@@ -1232,6 +1352,7 @@ class SolarSmartAsyncManager:
             # Reset served quota to 0 for the new window
             st["served_quota_mins"] = 0
             dev.updateStateOnServer("RuntimeQuotaMins", 0)
+            dev.updateStateOnServer("RuntimeWindowMins", 0)
             # Reset catch-up run accumulation for new quota window
             st["catchup_run_secs"] = 0.0
             try:
@@ -1336,6 +1457,53 @@ class SolarSmartAsyncManager:
 
         return None
 
+    def _debug7_log_device(self, dev, *, tier, status, action,
+                           run_min, remaining, needed_w, catchup,
+                           skip_reason, headroom, starts_this_tick,
+                           running_now):
+        """
+        Deep per-device diagnostic dump (debug7).
+        Logs IN-MEMORY 'st' plus key Indigo states & props so a single
+        scheduler tick log shows the full decision surface.
+
+        Only invoked when plugin.debug7 is True.
+        """
+        if not getattr(self.plugin, "debug7", False):
+            return
+        try:
+            st = self.plugin._load_state.get(dev.id, {}) or {}
+            props = dev.pluginProps or {}
+            ext_on = self.plugin._external_on_state(dev)
+            lines = []
+            lines.append(f"[DBG7] {dev.name} (id={dev.id}) Tier={props.get('tier','?')} "
+                         f"Decision: status={status} action={action} skip={skip_reason or '—'}")
+            lines.append(f"[DBG7]   RuntimeWindowMins(dev)={dev.states.get('RuntimeWindowMins','?')} "
+                         f"RuntimeQuotaMins(dev)={dev.states.get('RuntimeQuotaMins','?')} "
+                         f"RemainingQuotaMins(dev)={dev.states.get('RemainingQuotaMins','?')} "
+                         f"RuntimeQuotaPct(dev)={dev.states.get('RuntimeQuotaPct','?')}")
+            lines.append(f"[DBG7]   ServedQuotaMins(st)={st.get('served_quota_mins','?')} "
+                         f"RunWindowShown(run_min)={run_min} RemainingShown={remaining} NeededW={needed_w} "
+                         f"HeadroomNow={headroom}")
+            lines.append(f"[DBG7]   AnchorTs(st)={st.get('quota_anchor_ts')} "
+                         f"QuotaWindow={props.get('quotaWindow')} "
+                         f"MaxPerWindow={props.get('maxRuntimePerQuotaMins')}m "
+                         f"MinRuntime={props.get('minRuntimeMins')}m MaxRuntime={props.get('maxRuntimeMins')}m")
+            lines.append(f"[DBG7]   StartTs(st)={st.get('start_ts')} CooldownStart(st)={st.get('cooldown_start')} "
+                         f"IsRunning(state)={dev.states.get('IsRunning')} ExternalOn={ext_on}")
+            lines.append(f"[DBG7]   CatchUp: active(state)={dev.states.get('catchupActive')} "
+                         f"active(st)={st.get('catchup_active')} rem(state)={dev.states.get('catchupRemainingTodayMins')} "
+                         f"runToday(state)={dev.states.get('catchupRunTodayMins')} "
+                         f"runSecs(st)={st.get('catchup_run_secs')} targetProp={props.get('catchupRuntimeMins')} "
+                         f"window={props.get('catchupWindowStart','??')}-{props.get('catchupWindowEnd','??')} enable={props.get('enableCatchup')}")
+            lines.append(f"[DBG7]   Margins: surgeMult={props.get('surgeMultiplier')} "
+                         f"startMarginPct={props.get('startMarginPct')} keepMarginPct={props.get('keepMarginPct')}")
+            lines.append(f"[DBG7]   Concurrency: running_now={running_now} starts_this_tick={starts_this_tick}")
+            for ln in lines:
+                self.plugin.logger.debug(ln)
+        except Exception:
+            self.plugin.logger.exception(f"[DBG7] dump failed for {dev.name}")
+
+
     def _schedule_by_tier(self, loads_by_tier: dict[int, list[indigo.Device]], headroom_w: int, skip_reasons: dict[int, str]):
 
         max_concurrent = self._get_max_concurrent_loads()
@@ -1417,7 +1585,22 @@ class SolarSmartAsyncManager:
                         self._ensure_off(d, f"Not eligible: {skip_reason}")
                     status = "RUN" if self._is_running(d) else "OFF"
                     action = f"SKIP ({skip_reason})"
+
                     table_rows.append((tier, d.name, rated, status, run_min, remaining, needed_w, catchup_str, action))
+                    self._debug7_log_device(
+                        d,
+                        tier=tier,
+                        status=status,
+                        action=action,
+                        run_min=run_min,
+                        remaining=remaining,
+                        needed_w=needed_w,
+                        catchup=catchup_str,
+                        skip_reason=skip_reason,
+                        headroom=headroom_w,
+                        starts_this_tick=starts_this_tick,
+                        running_now=running_now
+                    )
                     # Do not modify headroom or attempt start
                     continue
 
@@ -1436,6 +1619,20 @@ class SolarSmartAsyncManager:
                         action = "KEEP"
                         status = "RUN"
                     table_rows.append((tier, d.name, rated, status, run_min, remaining, needed_w, catchup_str, action))
+                    self._debug7_log_device(
+                        d,
+                        tier=tier,
+                        status=status,
+                        action=action,
+                        run_min=run_min,
+                        remaining=remaining,
+                        needed_w=needed_w,
+                        catchup=catchup_str,
+                        skip_reason=skip_reason,
+                        headroom=headroom_w,
+                        starts_this_tick=starts_this_tick,
+                        running_now=running_now
+                    )
                     continue
 
             # start constraints
@@ -1466,6 +1663,20 @@ class SolarSmartAsyncManager:
 
             # (if you still build the table, append row here)
                 table_rows.append((tier, d.name, rated, status, run_min, remaining, needed_w, catchup_str, action))
+                self._debug7_log_device(
+                    d,
+                    tier=tier,
+                    status=status,
+                    action=action,
+                    run_min=run_min,
+                    remaining=remaining,
+                    needed_w=needed_w,
+                    catchup=catchup_str,
+                    skip_reason=skip_reason,
+                    headroom=headroom_w,
+                    starts_this_tick=starts_this_tick,
+                    running_now=running_now
+                )
 
         # OPTIONAL: final safety shed — shed only ONE more if still negative.
         # Comment this block out if you want strictly one action TOTAL per tick.
@@ -2484,6 +2695,14 @@ class Plugin(indigo.PluginBase):
                     dev.updateStateOnServer("IsRunning", True)
                     dev.updateStateOnServer("Status", "RUNNING")
                     dev.updateStateOnServer("LastReason", "Hydrate from external onOffState")
+                    if ext_on and not st.get("start_ts"):
+                        now_ts = time.time()
+                        st["start_ts"] = now_ts
+                        dev.updateStateOnServer("LastStartTs", f"{now_ts:.3f}")
+                        if getattr(self, "debug2", False):
+                            self.logger.debug(
+                                f"Hydrate: seeded start_ts for {dev.name} because external device is ON without persisted LastStartTs")
+
                 else:
                     dev.updateStateOnServer("IsRunning", False)
                     dev.updateStateOnServer("Status", "OFF")
