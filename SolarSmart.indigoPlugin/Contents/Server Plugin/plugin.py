@@ -1412,7 +1412,7 @@ class SolarSmartAsyncManager:
                     reason = "quota"
 
             # Reflect enforcement for ineligible loads
-            if reason:
+            if reason and self._is_running(dev):
                 self._ensure_off(dev, f"Not eligible: {reason}")
 
             tier = int(props.get("tier", 2))
@@ -2174,10 +2174,18 @@ class SolarSmartAsyncManager:
             if not was_running:
                 # Already off – just record reason and leave quietly
                 dev.updateStateOnServer("LastReason", reason)
+                ext_on = self.plugin._external_on_state(dev)
+                if ext_on:  # mismatch: external device is ON while we think OFF
+                    if getattr(self.plugin, "debug2", False):
+                        self.plugin.logger.debug(f"_ensure_off: {dev.name} external ON -> sending OFF ({reason})")
+                    # Suppress state overwrites; we'll refresh percent after.
+                    self.plugin._execute_load_action(dev, turn_on=False, reason=reason, update_states=False)
+                    dev.updateStateOnServer("IsRunning", False)
+                else:
+                    # No external ON, so we are already OFF
+                    if getattr(self.plugin, "debug2", False):
+                        self.plugin.logger.debug(f"_ensure_off: {dev.name} already OFF ({reason})")
                 self._update_runtime_progress(dev)
-                if getattr(self.plugin, "debug2", False):
-                    self.plugin.logger.debug(f"_ensure_off: {dev.name} already OFF ({reason})")
-                self.plugin._execute_load_action(dev, turn_on=False, reason=reason)
                 return
 
             # Snapshot observed metrics BEFORE stopping
