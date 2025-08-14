@@ -2723,26 +2723,84 @@ class Plugin(indigo.PluginBase):
 #
     def _external_on_state(self, load_dev: indigo.Device):
         """
-        If this SmartSolar Load is controlled by a real Indigo device (not an action group),
-        return that device's on/off (True/False). Otherwise return None.
-        Expected props:
-          - controlMode: "device" or "actionGroup"
-          - controlDeviceId: int (if device mode)
+        Determine the logical ON/OFF state of a SmartSolar Load that directly controls
+        an Indigo device (controlMode == 'device').
+
+        Returns:
+            True  -> Logical RUNNING (load considered ON by scheduler)
+            False -> Logical NOT RUNNING
+            None  -> Not applicable (e.g. action group mode / misconfig / target missing)
+
+        Logic:
+          1. Read the physical device's on/off (ext_on).
+             - Uses device.onState if available, else falls back to states['onOffState'].
+          2. Detect "inverted" pairing:
+                onCommand == 'turnOff' AND offCommand == 'turnOn'
+             In that eco/energy-saver pattern, the physical device ON means
+             "Eco Mode ENABLED" (so we treat scheduler logical running = False),
+             and physical OFF means "Eco Mode DISABLED" (logical running = True).
+          3. Return the appropriate logical boolean.
+
+        Debug 8 logging (very verbose):
+          Emits a single line per call when self.debug8 is True with:
+            device id, name, controlDeviceId, physical_on, inverted flag,
+            logical_on result, onCommand/offCommand choices.
         """
         try:
-            props = load_dev.pluginProps or {}
-            if (props.get("controlMode") or "").lower() != "device":
+            props = (load_dev.pluginProps or {})
+            mode = (props.get("controlMode") or "").lower()
+            if mode != "device":
+                if getattr(self, "debug8", False):
+                    self.logger.debug(f"[DBG8][_external_on_state] {load_dev.name} (#{load_dev.id}) mode={mode} -> return None")
                 return None
-            did = int(props.get("controlDeviceId", 0) or 0)
-            if did and did in indigo.devices:
-                ext = indigo.devices[did]
-                # Prefer the shortcut property; falls back to state
-                try:
-                    return bool(ext.onState)
-                except Exception:
-                    return bool(ext.states.get("onOffState", False))
-            return None
-        except Exception:
+
+            # Target device id
+            try:
+                target_id = int(props.get("controlDeviceId", 0) or 0)
+            except Exception:
+                target_id = 0
+
+            if target_id <= 0 or target_id not in indigo.devices:
+                if getattr(self, "debug8", False):
+                    self.logger.debug(
+                        f"[DBG8][_external_on_state] {load_dev.name} (#{load_dev.id}) invalid target_id={target_id} -> None"
+                    )
+                return None
+
+            target_dev = indigo.devices[target_id]
+
+            # Physical on/off
+            try:
+                physical_on = bool(target_dev.onState)
+            except Exception:
+                physical_on = bool(target_dev.states.get("onOffState", False))
+
+            # Commands selected
+            on_cmd = (props.get("onCommand") or "").strip()
+            off_cmd = (props.get("offCommand") or "").strip()
+
+            inverted = (on_cmd == "turnOff" and off_cmd == "turnOn")
+
+            if inverted:
+                logical_on = (not physical_on)
+            else:
+                logical_on = physical_on
+
+            if getattr(self, "debug8", False):
+                self.logger.debug(
+                    f"[DBG8][_external_on_state] Load:{load_dev.name} (#{load_dev.id}) "
+                    f"Target:{target_dev.name} (#{target_id}) mode=device "
+                    f"physical_on={physical_on} inverted={inverted} logical_on={logical_on} "
+                    f"onCommand='{on_cmd}' offCommand='{off_cmd}'"
+                )
+
+            return logical_on
+
+        except Exception as e:
+            if getattr(self, "debug8", False):
+                self.logger.debug(
+                    f"[DBG8][_external_on_state] {load_dev.name} (#{getattr(load_dev, 'id', '?')}) exception: {e} -> None"
+                )
             return None
 
     def _hydrate_load_state_from_device(self, dev: indigo.Device):
@@ -3459,12 +3517,6 @@ class Plugin(indigo.PluginBase):
             ok = False
 
         # Runtimes
-        if not _valid_pos_int(valuesDict.get("minRuntimeMins")):
-            errorDict["minRuntimeMins"] = "Enter minutes (positive integer)."
-            ok = False
-        if not _valid_pos_int(valuesDict.get("maxRuntimeMins")):
-            errorDict["maxRuntimeMins"] = "Enter minutes (positive integer)."
-            ok = False
         if not _valid_pos_int(valuesDict.get("maxRuntimePerQuotaMins")):
             errorDict["maxRuntimePerQuotaMins"] = "Enter minutes (positive integer)."
             ok = False

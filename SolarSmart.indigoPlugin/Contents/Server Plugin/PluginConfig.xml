@@ -70,9 +70,9 @@ Shorter time risks devices on and off, longer time misses Solar changes</Label>
         <Description>7. Debug Internal Variables (Verbose)</Description>
     </Field>
 
-    <Field id="debug8" type="checkbox" hidden="True"  tooltip="Enabling will .">
+    <Field id="debug8" type="checkbox" hidden="False" tooltip="Enabling will .">
         <Label/>
-        <Description>8. Debug 8</Description>
+        <Description>8. Debug 8 - Logic of On and Off</Description>
     </Field>
     <Field id="debug9" type="checkbox" hidden="True" tooltip="Enabling will .">
         <Label/>
