@@ -1412,6 +1412,9 @@ class SolarSmartAsyncManager:
                 # 1) If there is a skip reason, show row and do not attempt start
                 skip_reason = skip_reasons.get(d.id)
                 if skip_reason:
+                    if self._is_running(d):
+                        # Device became (or stayed) ON after mirroring; enforce policy again.
+                        self._ensure_off(d, f"Not eligible: {skip_reason}")
                     status = "RUN" if self._is_running(d) else "OFF"
                     action = f"SKIP ({skip_reason})"
                     table_rows.append((tier, d.name, rated, status, run_min, remaining, needed_w, catchup_str, action))
