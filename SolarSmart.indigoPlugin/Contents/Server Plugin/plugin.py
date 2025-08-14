@@ -1689,6 +1689,30 @@ class SolarSmartAsyncManager:
                     rated = 0
 
                 remaining = self._quota_remaining_mins(d, props, datetime.now())
+
+                # --- INSERT (derive display name with ECO state for inverted loads) ---
+                display_name = d.name
+                inverted = bool(props.get("invertOnOff", False))
+                if inverted and (props.get("controlMode", "").lower() == "device"):
+                    physical_on = None
+                    try:
+                        target_id = int(props.get("controlDeviceId", 0) or 0)
+                        if target_id in indigo.devices:
+                            tgt_dev = indigo.devices[target_id]
+                            try:
+                                physical_on = bool(tgt_dev.onState)
+                            except Exception:
+                                physical_on = bool(tgt_dev.states.get("onOffState", False))
+                    except Exception:
+                        physical_on = None
+                    # physical_on True  = ECO ON (saving)  -> logical OFF
+                    # physical_on False = ECO OFF (consuming) -> logical RUN
+                    if physical_on is not None:
+                        eco_phrase = "ECO ON" if physical_on else "ECO OFF"
+                        display_name = f"{d.name} ({eco_phrase})"
+                # --- END INSERT ---
+
+
                 surge_mult = float(props.get("surgeMultiplier", "1.2") or 1.2)
                 start_margin = float(props.get("startMarginPct", "20") or 20.0) / 100.0
                 needed_w = int(rated * surge_mult * (1.0 + start_margin))
@@ -1732,7 +1756,7 @@ class SolarSmartAsyncManager:
                     status = "RUN" if self._is_running(d) else "OFF"
                     action = f"SKIP ({skip_reason})"
 
-                    table_rows.append((tier, d.name, rated, status, run_min, remaining, needed_w, catchup_str, action))
+                    table_rows.append((tier, display_name, rated, status, run_min, remaining, needed_w, catchup_str, action))
                     self._debug7_log_device(
                         d,
                         tier=tier,
@@ -1760,11 +1784,11 @@ class SolarSmartAsyncManager:
                         action = "STOP"
                         status = "OFF"
                         if dbg:
-                            self.plugin.logger.debug(f"[STOP] {d.name}: {stop_reason} → headroom now {headroom_w}W")
+                            self.plugin.logger.debug(f"[STOP] {display_name}: {stop_reason} → headroom now {headroom_w}W")
                     else:
                         action = "KEEP"
                         status = "RUN"
-                    table_rows.append((tier, d.name, rated, status, run_min, remaining, needed_w, catchup_str, action))
+                    table_rows.append((tier, display_name, rated, status, run_min, remaining, needed_w, catchup_str, action))
                     self._debug7_log_device(
                         d,
                         tier=tier,
@@ -1802,13 +1826,13 @@ class SolarSmartAsyncManager:
                     action = "START"
                     status = "RUN"
                     if dbg:
-                        self.plugin.logger.debug(f"[START] {d.name}: rated={rated}W → headroom now {headroom_w}W")
+                        self.plugin.logger.debug(f"[START] {display_name}: rated={rated}W → headroom now {headroom_w}W")
                 else:
                     action = "SKIP (headroom)"
                     status = "OFF"
 
             # (if you still build the table, append row here)
-                table_rows.append((tier, d.name, rated, status, run_min, remaining, needed_w, catchup_str, action))
+                table_rows.append((tier, display_name, rated, status, run_min, remaining, needed_w, catchup_str, action))
                 self._debug7_log_device(
                     d,
                     tier=tier,
