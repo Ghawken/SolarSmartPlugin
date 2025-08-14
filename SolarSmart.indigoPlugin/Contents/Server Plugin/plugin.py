@@ -2180,6 +2180,9 @@ class Plugin(indigo.PluginBase):
         self.debug3 = self.pluginPrefs.get('debug3', False)
         self.debug4 = self.pluginPrefs.get('debug4',False)
         self.debug5 = self.pluginPrefs.get('debug5', False)
+        self.debug6 = self.pluginPrefs.get('debug6', False)
+        self.debug7 = self.pluginPrefs.get('debug7', False)
+        self.debug8 = self.pluginPrefs.get('debug8', False)
         self.indigo_log_handler.setLevel(self.logLevel)
         self.plugin_file_handler.setLevel(self.fileloglevel)
         self.pluginIsInitializing = False
