@@ -1585,6 +1585,44 @@ class SolarSmartAsyncManager:
             block.append(f"    Min Runtime: {min_run} min   Max Runtime (per start run): {max_run} min   Max Pref Window: {max_pref} min")
             block.append(f"    Quota Window Config: {quota_window}")
 
+            # ext_on here is the LOGICAL state (already inverted when invertOnOff=True)
+            logical_on = ext_on
+            physical_on = None
+            try:
+                props_mode = (props.get("controlMode") or "").lower()
+                if props_mode == "device":
+                    tgt_id = int(props.get("controlDeviceId", 0) or 0)
+                    if tgt_id and tgt_id in indigo.devices:
+                        tgt_dev = indigo.devices[tgt_id]
+                        try:
+                            physical_on = bool(tgt_dev.onState)
+                        except Exception:
+                            physical_on = bool(tgt_dev.states.get("onOffState", False))
+            except Exception:
+                pass
+
+            inverted = bool(props.get("invertOnOff", False))
+            block.append(f"🔌 External / Control")
+            if inverted:
+                # Show both physical and logical with explicit ECO semantics
+                # Physical ON  = ECO ON (saving) => logical OFF
+                # Physical OFF = ECO OFF (consuming) => logical ON
+                block.append(
+                    f"    Physical Device On: {physical_on} (ECO {'ON' if physical_on else 'OFF'})   "
+                    f"Logical Running: {logical_on}"
+                )
+            else:
+                block.append(
+                    f"    Physical Device On: {physical_on}   Logical Running: {logical_on}"
+                )
+            block.append(
+                f"    Start Ts: {start_ts} ({_fmt_ts(start_ts)})   Cooldown Start: {cooldown_start} ({_fmt_ts(cooldown_start)})"
+            )
+            block.append(
+                f"    Control Mode: {props.get('controlMode')}   Cooldown Mins: {cooldown_mins}"
+            )
+
+
             # Concurrency
             block.append(f"📦 Concurrency Snapshot")
             block.append(f"    Running Now: {running_now}   Starts This Tick: {starts_this_tick}")
@@ -2209,6 +2247,13 @@ class SolarSmartAsyncManager:
                     ran_secs = max(0, int(time.time() - st["start_ts"]))
                 except Exception:
                     ran_secs = None
+
+            # PHYSICAL ACTUATION (needed for inverted devices to enter ECO / saving mode)
+            # update_states=False to avoid temporarily overwriting logical state before we mark_running(False)
+            try:
+                self._execute_load_action(dev, turn_on=False, reason=reason, update_states=False)
+            except Exception:
+                pass
 
             self._mark_running(dev, False)
             dev.updateStateOnServer("LastReason", reason)
@@ -3634,8 +3679,13 @@ class Plugin(indigo.PluginBase):
                         indigo.device.turnOff(target_id)
 
                 if getattr(self, "debug8", False):
-                    self.logger.debug(f"[DBG8][_execute_load_action] {load_dev.name} logical_turn_on={turn_on} "
-                                      f"inverted={inverted} physical_desired_on={physical_desired_on} target_id={target_id}")
+                    eco_note = ""
+                    if inverted:
+                        eco_note = " (ECO will be {} after cmd)".format("ON" if physical_desired_on else "OFF")
+                    self.logger.debug(
+                        f"[DBG8][_execute_load_action] {load_dev.name} logical_turn_on={turn_on} "
+                        f"inverted={inverted} physical_desired_on={physical_desired_on} target_id={target_id}{eco_note}"
+                    )
                 if self.debug2:
                     self.logger.debug(f"Sent {'ON' if turn_on else 'OFF'} to device #{target_id} for {load_dev.name}")
 
