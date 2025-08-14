@@ -785,6 +785,8 @@ class SolarSmartAsyncManager:
 
                 # 2) Sync IsRunning from real devices (no commands sent)
                 self._sync_running_flags_from_external(loads_by_tier)
+                # Then enforce simplified daily deficit catch-up
+                self._catchup_deficit_scheduler(loads_by_tier)
 
                 # 3) Decide ON/OFF per tier (waterfall), but keep all in the table
                 self._schedule_by_tier(loads_by_tier, headroom_w, skip_reasons)
@@ -792,8 +794,7 @@ class SolarSmartAsyncManager:
                 # First accrue runtime (updates run_today_secs before deficit calc)
                 self._accrue_runtime_for_running_loads(period_sec)
 
-                # Then enforce simplified daily deficit catch-up
-                self._catchup_deficit_scheduler(loads_by_tier)
+
 
 
             except asyncio.CancelledError:
@@ -1386,6 +1387,24 @@ class SolarSmartAsyncManager:
                 start_margin = float(props.get("startMarginPct", "20") or 20.0) / 100.0
                 needed_w = int(rated * surge_mult * (1.0 + start_margin))
 
+                # Time already run in current window (simple, user‑visible)
+                try:
+                    run_min = int(d.states.get("RuntimeWindowMins", 0) or 0)
+                except Exception:
+                    run_min = 0
+
+                # Catch-up descriptor (simple English)
+                try:
+                    cu_active = bool(d.states.get("catchupActive", False))
+                    cu_rem = int(d.states.get("catchupRemainingTodayMins") or 0)
+                except Exception:
+                    cu_active, cu_rem = False, 0
+                if cu_active and cu_rem > 0:
+                    catchup_str = f"ACT {cu_rem}m"
+                elif (not cu_active) and cu_rem > 0:
+                    catchup_str = f"Need {cu_rem}m"
+                else:
+                    catchup_str = "—"
                 #status = "RUN" if self._is_running(d) else "OFF"
                 #action = ""
                 before_headroom = headroom_w
@@ -1395,7 +1414,7 @@ class SolarSmartAsyncManager:
                 if skip_reason:
                     status = "RUN" if self._is_running(d) else "OFF"
                     action = f"SKIP ({skip_reason})"
-                    table_rows.append((tier, d.name, rated, status, remaining, before_headroom, needed_w, action))
+                    table_rows.append((tier, d.name, rated, status, run_min, remaining, needed_w, catchup_str, action))
                     # Do not modify headroom or attempt start
                     continue
 
@@ -1413,7 +1432,7 @@ class SolarSmartAsyncManager:
                     else:
                         action = "KEEP"
                         status = "RUN"
-                    table_rows.append((tier, d.name, rated, status, remaining, before_headroom, needed_w, action))
+                    table_rows.append((tier, d.name, rated, status, run_min, remaining, needed_w, catchup_str, action))
                     continue
 
             # start constraints
@@ -1443,7 +1462,7 @@ class SolarSmartAsyncManager:
                     status = "OFF"
 
             # (if you still build the table, append row here)
-                table_rows.append((tier, d.name, rated, status, remaining, before_headroom, needed_w, action))
+                table_rows.append((tier, d.name, rated, status, run_min, remaining, needed_w, catchup_str, action))
 
         # OPTIONAL: final safety shed — shed only ONE more if still negative.
         # Comment this block out if you want strictly one action TOTAL per tick.
@@ -1453,82 +1472,82 @@ class SolarSmartAsyncManager:
         # Print summary table
         # At end of _schedule_by_tier()
 
-        # Build a dynamically sized table (header + rows) so columns align with long names
+        # ---------- Build & publish table (Plain English headers) ----------
         try:
-            # Map plain status/action to single-width symbols (dingbats) for alignment
-            status_marks = {
-                "RUN": "✓",  # running
-                "OFF": "✗",  # off
-                "PAUS": "⏸",  # paused (if you ever set it)
-            }
-            action_marks = {
-                "START": "⚡",
-                "KEEP": "▶",
-                "STOP": "■",
-                "SKIP": "·",  # bullet for skipped
-            }
+            status_marks = {"RUN": "✓", "OFF": "✗"}
+            action_marks = {"START": "⚡", "KEEP": "▶", "STOP": "■", "SKIP": "·"}
 
-            # 1) Dynamic widths
-            name_header = "Load Name"
-            name_width = max(len(name_header), max((len(name) for _, name, *_ in table_rows), default=0))
-            w_tier, w_rated, w_status, w_rem, w_hdrm, w_need, w_action = 4, 6, 6, 6, 8, 7, 7
+            # Dynamic width for load names
+            name_header = "Load"
+            name_width = max(len(name_header), max((len(n) for _, n, *_ in table_rows), default=0))
 
-            # 2) Row formatter (box-drawing grid)
-            def row_line(tier, name, rated, status, rem, hdrm, need, action):
-                # Normalize status/action text to 4-letter keys used above
-                status_key = "RUN" if status.upper().startswith("RUN") else "OFF"
-                action_key = (
-                    "START" if action.upper().startswith("START") else
-                    "KEEP" if action.upper().startswith("KEEP") else
-                    "STOP" if action.upper().startswith("STOP") else
-                    "SKIP"
-                )
-                s_icon = status_marks.get(status_key, " ")
-                a_icon = action_marks.get(action_key, " ")
+            # Column fixed widths (tune as needed)
+            w_tier = 4  # Tier
+            w_rated = 8  # Rated W
+            w_status = 6  # Status
+            w_run = 8  # Time Run
+            w_rem = 8  # Rem Mins
+            w_need = 7  # Watts Needed
+            w_cu = 10  # Catch-up
+            w_action = 10  # Action
 
+            def row_line(tier, name, rated, status, run_min, rem, need, cu, action):
+                s_key = "RUN" if status.upper().startswith("RUN") else "OFF"
+                a_up = action.upper()
+                if a_up.startswith("START"):
+                    a_key = "START"
+                elif a_up.startswith("KEEP"):
+                    a_key = "KEEP"
+                elif a_up.startswith("STOP"):
+                    a_key = "STOP"
+                else:
+                    a_key = "SKIP"
+                s_icon = status_marks.get(s_key, " ")
+                a_icon = action_marks.get(a_key, " ")
                 return (
                     f"{tier:<{w_tier}} │ "
                     f"{name:<{name_width}} │ "
                     f"{rated:<{w_rated}} │ "
-                    f"{s_icon} {status:<{w_status - 2}} │ "
+                    f"{s_icon} {s_key:<{w_status - 2}} │ "
+                    f"{run_min:>{w_run}} │ "
                     f"{rem:>{w_rem}} │ "
-                    f"{hdrm:>{w_hdrm}} │ "
                     f"{need:>{w_need}} │ "
-                    f"{a_icon} {action:<{w_action - 2}}"
+                    f"{cu:<{w_cu}} │ "
+                    f"{a_icon} {a_key:<{w_action - 2}}"
                 )
 
-            # 3) Header & separators (use emoji only in the banner)
             header = (
                 f"{'Tier':<{w_tier}} │ "
                 f"{name_header:<{name_width}} │ "
-                f"{'RatedW':<{w_rated}} │ "
+                f"{'Rated W':<{w_rated}} │ "
                 f"{'Status':<{w_status}} │ "
-                f"{'RemMin':>{w_rem}} │ "
-                f"{'Headroom':>{w_hdrm}} │ "
-                f"{'NeededW':>{w_need}} │ "
+                f"{'Time Run':>{w_run}} │ "
+                f"{'Rem Mins':>{w_rem}} │ "
+                f"{'Watts ':>{w_need}} │ "
+                f"{'Catch-up':<{w_cu}} │ "
                 f"{'Action':<{w_action}}"
             )
+
             sep_mid = (
                 f"{'─' * w_tier}─┼─"
                 f"{'─' * name_width}─┼─"
                 f"{'─' * w_rated}─┼─"
                 f"{'─' * w_status}─┼─"
+                f"{'─' * w_run}─┼─"
                 f"{'─' * w_rem}─┼─"
-                f"{'─' * w_hdrm}─┼─"
                 f"{'─' * w_need}─┼─"
+                f"{'─' * w_cu}─┼─"
                 f"{'─' * w_action}"
             )
-            # Cute emoji banner lines (don’t need to align with columns)
+
             banner_top = "🌞📈  SolarSmart Scheduler  📊🔌"
             banner_bottom = f"🌤️  Final headroom: {headroom_w} W"
 
-            # 4) Build rows
             rows_str = "\n".join(
-                row_line(tier, name, rated, status, rem, hdrm, need, action)
-                for tier, name, rated, status, rem, hdrm, need, action in table_rows
+                row_line(tier, name, rated, status, run_min, rem, need, cu, action)
+                for (tier, name, rated, status, run_min, rem, need, cu, action) in table_rows
             )
 
-            # 5) Debug log
             if dbg:
                 self.plugin.logger.debug(banner_top)
                 self.plugin.logger.debug(header)
@@ -1538,7 +1557,6 @@ class SolarSmartAsyncManager:
                 self.plugin.logger.debug(sep_mid)
                 self.plugin.logger.debug(banner_bottom)
 
-            # 6) Save to Main device state
             table_text = f"{banner_top}\n{header}\n{sep_mid}\n{rows_str}\n{sep_mid}\n{banner_bottom}"
 
             main_dev = None
@@ -1560,8 +1578,7 @@ class SolarSmartAsyncManager:
                 main_dev.updateStateOnServer("schedulerImagePath", out_path)
 
         except Exception as e:
-            self.plugin.logger.error(f"Error building schedulerTable: {e}")
-
+            self.plugin.logger.exception(f"Error building schedulerTable: {e}")
 
     # ---------- Keep & Start logic ----------
     def _evaluate_keep(self, dev: indigo.Device, headroom_w: int) -> int:
