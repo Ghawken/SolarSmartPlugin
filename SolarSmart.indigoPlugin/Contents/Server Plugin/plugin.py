@@ -353,6 +353,12 @@ class SolarSmartAsyncManager:
         for tier, devs in loads_by_tier.items():
             for d in devs:
                 ext_on = self.plugin._external_on_state(d)  # helper is in plugin
+                # --- INSERT (ensure inversion honored even if _external_on_state not updated) ---
+                props = d.pluginProps or {}
+                if ext_on is not None and props.get("invertOnOff", False):
+                    ext_on = not bool(ext_on)
+                    if getattr(self.plugin, "debug8", False):
+                        self.plugin.logger.debug(f"[DBG8][sync] {d.name} invertOnOff=True -> logical_on={ext_on}")
                 if ext_on is None:
                     continue  # no onOffState, likely action group controlled
 
@@ -2723,84 +2729,57 @@ class Plugin(indigo.PluginBase):
 #
     def _external_on_state(self, load_dev: indigo.Device):
         """
-        Determine the logical ON/OFF state of a SmartSolar Load that directly controls
-        an Indigo device (controlMode == 'device').
+        Logical ON/OFF state for a SmartSolar Load in device control mode.
+
+        Physical device semantics with invertOnOff:
+          invertOnOff = False (normal):
+             physical ON  -> logical ON
+             physical OFF -> logical OFF
+          invertOnOff = True (inverted / ECO device):
+             physical OFF -> logical ON  (we are 'running' when ECO is disabled)
+             physical ON  -> logical OFF (ECO enabled = not running)
 
         Returns:
-            True  -> Logical RUNNING (load considered ON by scheduler)
-            False -> Logical NOT RUNNING
-            None  -> Not applicable (e.g. action group mode / misconfig / target missing)
+            True  -> logical running
+            False -> logical not running
+            None  -> not in device mode or invalid target
 
-        Logic:
-          1. Read the physical device's on/off (ext_on).
-             - Uses device.onState if available, else falls back to states['onOffState'].
-          2. Detect "inverted" pairing:
-                onCommand == 'turnOff' AND offCommand == 'turnOn'
-             In that eco/energy-saver pattern, the physical device ON means
-             "Eco Mode ENABLED" (so we treat scheduler logical running = False),
-             and physical OFF means "Eco Mode DISABLED" (logical running = True).
-          3. Return the appropriate logical boolean.
-
-        Debug 8 logging (very verbose):
-          Emits a single line per call when self.debug8 is True with:
-            device id, name, controlDeviceId, physical_on, inverted flag,
-            logical_on result, onCommand/offCommand choices.
+        Debug 8: one line showing physical_on, inverted flag, and logical result.
         """
         try:
-            props = (load_dev.pluginProps or {})
-            mode = (props.get("controlMode") or "").lower()
-            if mode != "device":
+            props = load_dev.pluginProps or {}
+            if (props.get("controlMode") or "").lower() != "device":
                 if getattr(self, "debug8", False):
-                    self.logger.debug(f"[DBG8][_external_on_state] {load_dev.name} (#{load_dev.id}) mode={mode} -> return None")
+                    self.logger.debug(f"[DBG8][_external_on_state] {load_dev.name} non-device mode -> None")
                 return None
 
-            # Target device id
             try:
                 target_id = int(props.get("controlDeviceId", 0) or 0)
             except Exception:
                 target_id = 0
-
             if target_id <= 0 or target_id not in indigo.devices:
                 if getattr(self, "debug8", False):
-                    self.logger.debug(
-                        f"[DBG8][_external_on_state] {load_dev.name} (#{load_dev.id}) invalid target_id={target_id} -> None"
-                    )
+                    self.logger.debug(f"[DBG8][_external_on_state] {load_dev.name} invalid target_id={target_id}")
                 return None
 
-            target_dev = indigo.devices[target_id]
-
-            # Physical on/off
+            tgt = indigo.devices[target_id]
             try:
-                physical_on = bool(target_dev.onState)
+                physical_on = bool(tgt.onState)
             except Exception:
-                physical_on = bool(target_dev.states.get("onOffState", False))
+                physical_on = bool(tgt.states.get("onOffState", False))
 
-            # Commands selected
-            on_cmd = (props.get("onCommand") or "").strip()
-            off_cmd = (props.get("offCommand") or "").strip()
-
-            inverted = (on_cmd == "turnOff" and off_cmd == "turnOn")
-
-            if inverted:
-                logical_on = (not physical_on)
-            else:
-                logical_on = physical_on
+            inverted = bool(props.get("invertOnOff", False))
+            logical_on = (not physical_on) if inverted else physical_on
 
             if getattr(self, "debug8", False):
                 self.logger.debug(
-                    f"[DBG8][_external_on_state] Load:{load_dev.name} (#{load_dev.id}) "
-                    f"Target:{target_dev.name} (#{target_id}) mode=device "
-                    f"physical_on={physical_on} inverted={inverted} logical_on={logical_on} "
-                    f"onCommand='{on_cmd}' offCommand='{off_cmd}'"
+                    f"[DBG8][_external_on_state] {load_dev.name} target={tgt.name} "
+                    f"physical_on={physical_on} inverted={inverted} logical_on={logical_on}"
                 )
-
             return logical_on
-
         except Exception as e:
             if getattr(self, "debug8", False):
-                self.logger.debug(
-                    f"[DBG8][_external_on_state] {load_dev.name} (#{getattr(load_dev, 'id', '?')}) exception: {e} -> None"
-                )
+                self.logger.debug(f"[DBG8][_external_on_state] {load_dev.name} exception: {e}")
             return None
 
     def _hydrate_load_state_from_device(self, dev: indigo.Device):
@@ -2881,8 +2860,11 @@ class Plugin(indigo.PluginBase):
                 ext_on = None
 
             if ext_on is not None:
-                st["IsRunning"] = bool(ext_on)
-                if ext_on:
+                inverted = bool(props.get("invertOnOff", False))
+                logical_on = (not ext_on) if inverted else bool(ext_on)
+
+                st["IsRunning"] = logical_on
+                if logical_on:
                     dev.updateStateOnServer("IsRunning", True)
                     dev.updateStateOnServer("Status", "RUNNING")
                     dev.updateStateOnServer("LastReason", "Hydrate from external onOffState")
@@ -3632,8 +3614,12 @@ class Plugin(indigo.PluginBase):
 
                 on_cmd = (props.get("onCommand") or "turnOn").strip()
                 off_cmd = (props.get("offCommand") or "turnOff").strip()
+                # --- INSERT (invert mapping) ---
+                inverted = bool(props.get("invertOnOff", False))
+                # Logical ON (turn_on=True) should drive physical OFF when inverted
+                physical_desired_on = (not turn_on) if inverted else turn_on
 
-                if turn_on:
+                if physical_desired_on:
                     if on_cmd == "toggle":
                         indigo.device.toggle(target_id)
                     else:
@@ -3644,6 +3630,9 @@ class Plugin(indigo.PluginBase):
                     else:
                         indigo.device.turnOff(target_id)
 
+                if getattr(self, "debug8", False):
+                    self.logger.debug(f"[DBG8][_execute_load_action] {load_dev.name} logical_turn_on={turn_on} "
+                                      f"inverted={inverted} physical_desired_on={physical_desired_on} target_id={target_id}")
                 if self.debug2:
                     self.logger.debug(f"Sent {'ON' if turn_on else 'OFF'} to device #{target_id} for {load_dev.name}")
 

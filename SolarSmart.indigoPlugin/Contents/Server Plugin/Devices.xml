@@ -282,7 +282,6 @@
       <Label>ON Command:</Label>
       <List>
         <Option value="turnOn">Turn On</Option>
-        <Option value="turnOff">Turn Off (invert)</Option>
         <Option value="toggle">Toggle</Option>
       </List>
     </Field>
@@ -290,9 +289,18 @@
       <Label>OFF Command:</Label>
       <List>
         <Option value="turnOff">Turn Off</Option>
-         <Option value="turnOn">Turn On (invert)</Option>
         <Option value="toggle">Toggle</Option>
       </List>
+    </Field>
+    <Field id="invertOnOff" type="checkbox" defaultValue="false" visibleBindingId="controlMode" visibleBindingValue="device">
+      <Label>Invert ON/OFF Logic</Label>
+      <Description></Description>
+    </Field>
+            <Field id="invert_hint" type="label" fontColor="blue" fontSize="small" alwaysUseInDialogHeightCalc="true">
+      <Label>Inverted ON / OFF
+When enabled, scheduler ON = send physical OFF
+and logical running state is true while the physical device is OFF
+(e.g. ECO mode devices).</Label>
     </Field>
     <Field id="sep_test" type="separator"/>
     <Field id="testOn" type="button" fontSize="medium" fontColor="blue">
