@@ -3592,6 +3592,12 @@ class Plugin(indigo.PluginBase):
                 load_dev.updateStateOnServer("IsRunning", turn_on)
                 load_dev.updateStateOnServer("LastReason", reason)
                 load_dev.updateStateOnServer("Status", "RUNNING" if turn_on else "OFF")
+                # Immediately replace plain RUNNING/OFF with percentage form
+                try:
+                    if hasattr(self, "_ss_manager"):
+                        self._ss_manager._update_runtime_progress(load_dev)
+                except Exception:
+                    pass
 
         except Exception as e:
             self.logger.error(f"Error executing action for {load_dev.name}: {e}")
