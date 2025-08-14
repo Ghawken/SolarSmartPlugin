@@ -2770,6 +2770,12 @@ class Plugin(indigo.PluginBase):
                 st["served_quota_mins"] = target
                 dev.updateStateOnServer("RuntimeQuotaMins", target)
 
+            if target > 0 and st["served_quota_mins"] >= target:
+                # Refresh anchor so first tick doesn’t treat it as expired.
+                now_ts = time.time()
+                st["quota_anchor_ts"] = now_ts
+                dev.updateStateOnServer("QuotaAnchorTs", f"{now_ts:.3f}")
+
             # Ensure window runtime state exists (cosmetic)
             try:
                 run_window = int(dev.states.get("RuntimeWindowMins", 0) or 0)
