@@ -1463,45 +1463,136 @@ class SolarSmartAsyncManager:
                            running_now):
         """
         Deep per-device diagnostic dump (debug7).
-        Logs IN-MEMORY 'st' plus key Indigo states & props so a single
-        scheduler tick log shows the full decision surface.
+        Produces a single multi-line INFO block (readable) containing:
+          • Decision context
+          • Preferred (window/"quota") runtime counters
+          • Catch-up status
+          • External / control linkage
+          • Power / thresholds
+          • Concurrency snapshot
+          • Raw internal st[] keys (sorted) for unexpected values
 
-        Only invoked when plugin.debug7 is True.
+        Only emitted when plugin.debug7 is True.
         """
         if not getattr(self.plugin, "debug7", False):
             return
+
         try:
             st = self.plugin._load_state.get(dev.id, {}) or {}
             props = dev.pluginProps or {}
             ext_on = self.plugin._external_on_state(dev)
-            lines = []
-            lines.append(f"[DBG7] {dev.name} (id={dev.id}) Tier={props.get('tier','?')} "
-                         f"Decision: status={status} action={action} skip={skip_reason or '—'}")
-            lines.append(f"[DBG7]   RuntimeWindowMins(dev)={dev.states.get('RuntimeWindowMins','?')} "
-                         f"RuntimeQuotaMins(dev)={dev.states.get('RuntimeQuotaMins','?')} "
-                         f"RemainingQuotaMins(dev)={dev.states.get('RemainingQuotaMins','?')} "
-                         f"RuntimeQuotaPct(dev)={dev.states.get('RuntimeQuotaPct','?')}")
-            lines.append(f"[DBG7]   ServedQuotaMins(st)={st.get('served_quota_mins','?')} "
-                         f"RunWindowShown(run_min)={run_min} RemainingShown={remaining} NeededW={needed_w} "
-                         f"HeadroomNow={headroom}")
-            lines.append(f"[DBG7]   AnchorTs(st)={st.get('quota_anchor_ts')} "
-                         f"QuotaWindow={props.get('quotaWindow')} "
-                         f"MaxPerWindow={props.get('maxRuntimePerQuotaMins')}m "
-                         f"MinRuntime={props.get('minRuntimeMins')}m MaxRuntime={props.get('maxRuntimeMins')}m")
-            lines.append(f"[DBG7]   StartTs(st)={st.get('start_ts')} CooldownStart(st)={st.get('cooldown_start')} "
-                         f"IsRunning(state)={dev.states.get('IsRunning')} ExternalOn={ext_on}")
-            lines.append(f"[DBG7]   CatchUp: active(state)={dev.states.get('catchupActive')} "
-                         f"active(st)={st.get('catchup_active')} rem(state)={dev.states.get('catchupRemainingTodayMins')} "
-                         f"runToday(state)={dev.states.get('catchupRunTodayMins')} "
-                         f"runSecs(st)={st.get('catchup_run_secs')} targetProp={props.get('catchupRuntimeMins')} "
-                         f"window={props.get('catchupWindowStart','??')}-{props.get('catchupWindowEnd','??')} enable={props.get('enableCatchup')}")
-            lines.append(f"[DBG7]   Margins: surgeMult={props.get('surgeMultiplier')} "
-                         f"startMarginPct={props.get('startMarginPct')} keepMarginPct={props.get('keepMarginPct')}")
-            lines.append(f"[DBG7]   Concurrency: running_now={running_now} starts_this_tick={starts_this_tick}")
-            for ln in lines:
-                self.plugin.logger.debug(ln)
+
+            # Choose log level (switch to .debug if you prefer quieter)
+            log_func = self.plugin.logger.info
+
+            # Friendly helpers
+            def _pint(v):
+                try:
+                    return int(v)
+                except Exception:
+                    return v
+
+            rated = 0
+            try:
+                rated = int(float(props.get("ratedWatts", 0)) or 0)
+            except Exception:
+                pass
+
+            max_pref = props.get("maxRuntimePerQuotaMins")
+            min_run = props.get("minRuntimeMins")
+            max_run = props.get("maxRuntimeMins")
+            quota_window = props.get("quotaWindow")
+            surge_mult = props.get("surgeMultiplier")
+            start_margin_pct = props.get("startMarginPct")
+            keep_margin_pct = props.get("keepMarginPct")
+            cooldown_mins = props.get("cooldownMins")
+
+            served_quota = st.get("served_quota_mins")
+            anchor_ts = st.get("quota_anchor_ts")
+            start_ts = st.get("start_ts")
+            cooldown_start = st.get("cooldown_start")
+
+            catch_active_state = dev.states.get("catchupActive")
+            catch_active_st = st.get("catchup_active")
+            catch_remaining = dev.states.get("catchupRemainingTodayMins")
+            catch_target = dev.states.get("catchupDailyTargetMins")
+            catch_run_today = dev.states.get("catchupRunTodayMins")
+            catch_run_secs = st.get("catchup_run_secs")
+
+            pct = dev.states.get("RuntimeQuotaPct")
+            run_quota_dev = dev.states.get("RuntimeQuotaMins")
+            rem_dev = dev.states.get("RemainingQuotaMins")
+            run_window_dev = dev.states.get("RuntimeWindowMins")
+
+            # Time conversions
+            def _fmt_ts(ts):
+                if not ts:
+                    return "—"
+                try:
+                    return datetime.fromtimestamp(float(ts)).strftime("%H:%M:%S")
+                except Exception:
+                    return str(ts)
+
+            # Raw internal state key dump (sorted)
+            raw_state_lines = []
+            for k in sorted(st.keys()):
+                raw_state_lines.append(f"    {k}: {st.get(k)!r}")
+
+            block = []
+            block.append("")
+            block.append(f"════════════════════════════════════════════════════════════════════════════════")
+            block.append(f"🔍 DBG7 Device: {dev.name}  (id={dev.id})  Tier {tier}")
+            block.append(f"════════════════════════════════════════════════════════════════════════════════")
+
+            # Decision
+            block.append(f"🧠 Decision")
+            block.append(f"    Status: {status}   Action: {action}   Skip: {skip_reason or '—'}")
+            block.append(f"    Headroom Now: {headroom} W   StartsThisTick: {starts_this_tick}   RunningNow: {running_now}")
+
+            # Preferred window (window/quota) runtime
+            block.append(f"⏱️ Preferred Window Runtime")
+            block.append(f"    Served (internal): {served_quota} min   Window Run (state): {run_window_dev} min")
+            block.append(f"    Remaining (state): {rem_dev} min   Remaining (shown row): {remaining} min")
+            block.append(f"    Used (state RuntimeQuotaMins): {run_quota_dev} min   Percent: {pct}%")
+            block.append(f"    Anchor Start (ts): {anchor_ts} ({_fmt_ts(anchor_ts)})")
+
+            # Catch-up
+            block.append(f"🛟 Catch-up / Fallback")
+            block.append(f"    Active: state={catch_active_state} / mem={catch_active_st}   Catch-up Str Col: {catchup}")
+            block.append(f"    Target: {catch_target} min   Remaining: {catch_remaining} min")
+            block.append(f"    Run Today (state): {catch_run_today} min   Run (active secs mem): {catch_run_secs} s")
+            block.append(f"    Window: {props.get('catchupWindowStart','??')} - {props.get('catchupWindowEnd','??')}   Enabled: {props.get('enableCatchup')}")
+
+            # External / control
+            block.append(f"🔌 External / Control")
+            block.append(f"    External Device On: {ext_on}   IsRunning(state): {dev.states.get('IsRunning')}")
+            block.append(f"    Start Ts: {start_ts} ({_fmt_ts(start_ts)})   Cooldown Start: {cooldown_start} ({_fmt_ts(cooldown_start)})")
+            block.append(f"    Control Mode: {props.get('controlMode')}   Cooldown Mins: {cooldown_mins}")
+
+            # Power & thresholds
+            block.append(f"⚡ Power & Thresholds")
+            block.append(f"    Rated: {rated} W   Needed (start threshold est): {needed_w} W")
+            block.append(f"    Surge Mult: {surge_mult}   Start Margin %: {start_margin_pct}   Keep Margin %: {keep_margin_pct}")
+            block.append(f"    Min Runtime: {min_run} min   Max Runtime (per start run): {max_run} min   Max Pref Window: {max_pref} min")
+            block.append(f"    Quota Window Config: {quota_window}")
+
+            # Concurrency
+            block.append(f"📦 Concurrency Snapshot")
+            block.append(f"    Running Now: {running_now}   Starts This Tick: {starts_this_tick}")
+
+            # Raw internal dict
+            block.append(f"🗂️ Raw Internal st[] Keys")
+            if raw_state_lines:
+                block.extend(raw_state_lines)
+            else:
+                block.append("    (empty)")
+
+            block.append(f"────────────────────────────────────────────────────────────────────────────────")
+
+            log_func("\n".join(block))
+
         except Exception:
-            self.plugin.logger.exception(f"[DBG7] dump failed for {dev.name}")
+            self.plugin.logger.exception(f"[DBG7] multi-line dump failed for {dev.name}")
 
 
     def _schedule_by_tier(self, loads_by_tier: dict[int, list[indigo.Device]], headroom_w: int, skip_reasons: dict[int, str]):
@@ -1561,20 +1652,28 @@ class SolarSmartAsyncManager:
                 except Exception:
                     run_min = 0
 
-                # Catch-up descriptor (simple English)
+                # Catch-up descriptor (clear English)
                 try:
+                    props_enable_cu = bool(props.get("enableCatchup", False))
                     cu_active = bool(d.states.get("catchupActive", False))
                     cu_rem = int(d.states.get("catchupRemainingTodayMins") or 0)
+                    cu_target = int(d.states.get("catchupDailyTargetMins") or 0)
                 except Exception:
-                    cu_active, cu_rem = False, 0
-                if cu_active and cu_rem > 0:
-                    catchup_str = f"ACT {cu_rem}m"
-                elif (not cu_active) and cu_rem > 0:
-                    catchup_str = f"Need {cu_rem}m"
+                    props_enable_cu = False
+                    cu_active = False
+                    cu_rem = 0
+                    cu_target = 0
+
+                if not props_enable_cu or cu_target <= 0:
+                    catchup_str = "Off"
+                elif cu_rem <= 0:
+                    # Target configured & satisfied
+                    catchup_str = "Met"
                 else:
-                    catchup_str = "—"
-                #status = "RUN" if self._is_running(d) else "OFF"
-                #action = ""
+                    if cu_active:
+                        catchup_str = f"ACT {cu_rem}m"
+                    else:
+                        catchup_str = f"Need {cu_rem}m"
                 before_headroom = headroom_w
 
                 # 1) If there is a skip reason, show row and do not attempt start
