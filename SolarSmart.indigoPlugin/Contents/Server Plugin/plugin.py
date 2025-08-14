@@ -2757,24 +2757,42 @@ class Plugin(indigo.PluginBase):
             s_ts = dev.states.get("LastStartTs", "")
             st["start_ts"] = float(s_ts) if s_ts not in ("", None, "") else None
 
-            # Ensure RemainingQuotaMins matches props target
             props = dev.pluginProps or {}
-            target = int(props.get("maxRuntimePerQuotaMins") or 0)
+            target = 0
+            try:
+                target = int(props.get("maxRuntimePerQuotaMins") or 0)
+            except Exception:
+                target = 0
+
+            # --- MINIMAL NORMALISATION (overshoot & cosmetic window) ---
+            # Clamp overshoot of served minutes to target so we never hydrate >100%
+            if target > 0 and st["served_quota_mins"] > target:
+                st["served_quota_mins"] = target
+                dev.updateStateOnServer("RuntimeQuotaMins", target)
+
+            # Ensure window runtime state exists (cosmetic)
+            try:
+                run_window = int(dev.states.get("RuntimeWindowMins", 0) or 0)
+            except Exception:
+                run_window = 0
+            if dev.states.get("RuntimeWindowMins", None) is None:
+                dev.updateStateOnServer("RuntimeWindowMins", run_window)
+
+            # If window runtime > served (after clamp), trim it so the table is consistent
+            if run_window > st["served_quota_mins"]:
+                dev.updateStateOnServer("RuntimeWindowMins", st["served_quota_mins"])
+
+            # Recompute RemainingQuotaMins from (target - served) after clamp
             remaining = max(0, target - st["served_quota_mins"]) if target > 0 else 0
             dev.updateStateOnServer("RemainingQuotaMins", remaining)
 
-            # Ensure window runtime state exists (cosmetic)
-            if dev.states.get("RuntimeWindowMins", None) is None:
-                dev.updateStateOnServer("RuntimeWindowMins", 0)
-
-            # If no anchor yet, create one without wiping minutes
+            # If no anchor yet, create one (do NOT reset served)
             if st.get("quota_anchor_ts") is None:
                 now_ts = time.time()
                 st["quota_anchor_ts"] = now_ts
                 dev.updateStateOnServer("QuotaAnchorTs", f"{now_ts:.3f}")
 
             # --- Mirror external device on/off if available ---
-            # Expect props: controlMode = "device" / "actionGroup"; controlDeviceId when device mode
             ext_on = None
             try:
                 ctrl_mode = (props.get("controlMode") or "").lower()
@@ -2784,40 +2802,38 @@ class Plugin(indigo.PluginBase):
                         ext = indigo.devices[ctrl_id]
                         self.logger.debug(f"Startup Target Device Checking: {ext.name} {ext.onState=}")
                         try:
-                            ext_on = bool(ext.onState)  # shortcut
+                            ext_on = bool(ext.onState)
                         except Exception:
                             ext_on = bool(ext.states.get("onOffState", False))
             except Exception:
                 ext_on = None
 
             if ext_on is not None:
-                # Reflect real device state; no actions here
                 st["IsRunning"] = bool(ext_on)
                 if ext_on:
                     dev.updateStateOnServer("IsRunning", True)
                     dev.updateStateOnServer("Status", "RUNNING")
                     dev.updateStateOnServer("LastReason", "Hydrate from external onOffState")
-                    if ext_on and not st.get("start_ts"):
+                    # Seed start_ts if device ON but we had none
+                    if not st.get("start_ts"):
                         now_ts = time.time()
                         st["start_ts"] = now_ts
                         dev.updateStateOnServer("LastStartTs", f"{now_ts:.3f}")
                         if getattr(self, "debug2", False):
                             self.logger.debug(
                                 f"Hydrate: seeded start_ts for {dev.name} because external device is ON without persisted LastStartTs")
-
                 else:
                     dev.updateStateOnServer("IsRunning", False)
                     dev.updateStateOnServer("Status", "OFF")
                     dev.updateStateOnServer("LastReason", "Hydrate from external onOffState")
             else:
-                # No external state to trust (e.g., action group control) — do NOT resume running
                 st["IsRunning"] = False
                 dev.updateStateOnServer("IsRunning", False)
                 dev.updateStateOnServer("Status", "OFF")
-                # Only set LastReason if empty to avoid clobbering recent info
                 if not dev.states.get("LastReason"):
                     dev.updateStateOnServer("LastReason", "Plugin restart recovery")
 
+            # Catch-up run secs rehydrate
             try:
                 cur_cu_run = int(dev.states.get("catchupRunTodayMins", 0) or 0)
                 st.setdefault("catchup_run_secs", cur_cu_run * 60)
@@ -2826,15 +2842,20 @@ class Plugin(indigo.PluginBase):
 
             if getattr(self, "debug2", False):
                 self.logger.debug(
-                    f"Hydrated {dev.name}: served={st['served_quota_mins']}m, "
+                    f"Hydrated {dev.name}: served={st['served_quota_mins']}m (target={target}m), "
+                    f"remaining={dev.states.get('RemainingQuotaMins')}m, "
+                    f"windowRun={dev.states.get('RuntimeWindowMins')}m, "
                     f"anchor={st['quota_anchor_ts']}, start_ts={st.get('start_ts')}, "
                     f"IsRunning={st.get('IsRunning')} (ext_on={ext_on})"
                 )
+
+            # Update runtime percent / Status (NN%) after adjustments
             try:
                 if hasattr(self, "_ss_manager"):
                     self._ss_manager._update_runtime_progress(dev)
             except Exception:
                 pass
+
         except Exception:
             self.logger.exception(f"Hydrate failed for {dev.name}")
 
