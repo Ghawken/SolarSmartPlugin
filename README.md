@@ -475,6 +475,188 @@ Diagnostics tips:
 - If loads don’t start, check time windows/days, quotas, and tier ordering.
 - Use Debug temporarily to trace scheduling decisions end-to-end.
 
+## Deep Scheduler Diagnostics (Debug Level 7)
+
+When you enable the (very verbose) `debug7` flag in plugin preferences the scheduler emits a structured, multi‑section diagnostic block for each SmartSolar Load every tick. This is intended for advanced troubleshooting of start / stop eligibility, quota rollover, and catch‑up (fallback) behavior.
+
+Example (actual output):
+
+```
+════════════════════════════════════════════════════════════════════════════════
+🔍 DBG7 Device: SolarSmart Load Pool 2000W No Heater  (id=127719016)  Tier 1
+════════════════════════════════════════════════════════════════════════════════
+🧠 Decision
+    Status: OFF   Action: SKIP (quota)   Skip: quota
+    Headroom Now: -111 W   StartsThisTick: 0   RunningNow: 0
+⏱️ Preferred Window Runtime
+    Served (internal): 240 min   Window Run (state): 240 min
+    Remaining (state): 0 min   Remaining (shown row): 0 min
+    Used (state RuntimeQuotaMins): 240 min   Percent: 100%
+    Anchor Start (ts): 1755149613.112328 (15:33:33)
+🛟 Catch-up / Fallback
+    Active: state=False / mem=None   Catch-up Str Col: Met
+    Target: 120 min   Remaining: 0 min
+    Run Today (state): 0 min   Run (active secs mem): 0 s
+    Window: 00:00 - 06:00   Enabled: True
+🔌 External / Control
+    External Device On: False   IsRunning(state): False
+    Start Ts: None (—)   Cooldown Start: None (—)
+    Control Mode: device   Cooldown Mins: 10
+⚡ Power & Thresholds
+    Rated: 2000 W   Needed (start threshold est): 2200 W
+    Surge Mult: 1.00   Start Margin %: 10   Keep Margin %: 5
+    Min Runtime: 30 min   Max Runtime (per start run): 240 min   Max Pref Window: 240 min
+    Quota Window Config: 1d
+📦 Concurrency Snapshot
+    Running Now: 0   Starts This Tick: 0
+🗂️ Raw Internal st[] Keys
+    IsRunning: False
+    catchup_run_secs: 0
+    quota_anchor_ts: 1755149613.112328
+    run_today_secs: 0.0
+    served_quota_mins: 240
+    start_ts: None
+    today_key: '2025-08-14'
+────────────────────────────────────────────────────────────────────────────────
+```
+
+### Section Glossary
+
+1. 🧠 Decision  
+   - Status: Current running state just before/after decision (OFF / RUNNING).  
+   - Action: What the scheduler decided for this tick:
+     - START: Load was started this tick.
+     - KEEP: Load was already running and kept on.
+     - STOP: Load was running and was turned off.
+     - SKIP (<reason>): Load is OFF and ineligible due to the reason (quota, headroom, window, cooldown, concurrency, cap).
+   - Skip: Raw skip reason (same as parentheses).
+   - Headroom Now: Headroom snapshot (W) used for this load’s evaluation.
+   - StartsThisTick: How many loads have already been started this tick (enforces per‑tick cap).
+   - RunningNow: Total loads running at the moment of evaluation (for concurrency limit).
+
+2. ⏱️ Preferred Window Runtime  
+   Tracks runtime within the rolling “preferred” quota window:
+   - Served (internal): Authoritative in‑memory minutes used (`served_quota_mins`).
+   - Window Run (state): Cosmetic counter mirrored to device state `RuntimeWindowMins` (resets at rollover; trimmed to Served on hydrate).
+   - Remaining (state): Device state `RemainingQuotaMins` after last update.
+   - Remaining (shown row): Same value used when assembling the scheduler table line that tick.
+   - Used (state RuntimeQuotaMins): The mirrored device state copy of Served.
+   - Percent: Computed `(served / target) * 100` (clamped) → used to embed “(NN%)” into Status.
+   - Anchor Start (ts): Epoch timestamp for start of current quota window plus a human time in parentheses.
+
+3. 🛟 Catch-up / Fallback  
+   Fallback (scheduled catch‑up) semantics:
+   - Active: Two sources shown: device state (`catchupActive`) and in‑memory (`catchup_active`) for validation.
+   - Catch-up Str Col: Short string used in the scheduler table “Catch-up” column:
+     - Off: Catch‑up disabled or target = 0
+     - Met: Target configured but remaining fallback = 0
+     - ACT Xm: Catch‑up is actively forcing the device ON; X minutes still needed
+     - Need Xm: Catch‑up not active yet; X minutes deficit remains
+   - Target: `catchupDailyTargetMins` (configured fallback minutes).
+   - Remaining: `catchupRemainingTodayMins` (deficit after subtracting Served).
+   - Run Today (state): Minutes run under active catch‑up this window (mirrored from `catchup_run_secs`).
+   - Run (active secs mem): Raw seconds counter for catch‑up runtime while active.
+   - Window: Configured fallback window start → end.
+   - Enabled: Boolean `enableCatchup` property.
+
+4. 🔌 External / Control  
+   - External Device On: Actual on/off state of the controlled Indigo device (if using device control mode). `None` or False if action groups or not controllable.
+   - IsRunning(state): The plugin’s canonical IsRunning device state.
+   - Start Ts: Epoch of last scheduler start (in‑memory) or None.
+   - Cooldown Start: Timestamp when cooldown began (if tracked).
+   - Control Mode: `device` or `actionGroup`.
+   - Cooldown Mins: Configured cooldown (minutes) before a restart is allowed.
+
+5. ⚡ Power & Thresholds  
+   - Rated: Configured `ratedWatts`.
+   - Needed (start threshold est): Start trigger threshold = rated * surgeMultiplier * (1 + startMargin%).
+   - Surge Mult / Start Margin % / Keep Margin %: Raw configuration used for start/keep decisions.
+   - Min / Max Runtime: Per-start run time constraints (minRuntimeMins / maxRuntimeMins).
+   - Max Pref Window: `maxRuntimePerQuotaMins` (target for the rolling preferred window).
+   - Quota Window Config: The selected rolling window length (e.g., 1d / 2d / 12h).
+
+6. 📦 Concurrency Snapshot  
+   - Running Now: Total currently running loads (after any immediate stop decisions).
+   - Starts This Tick: Safety counter to ensure only one (or configured limit) new start per scheduler tick.
+
+7. 🗂️ Raw Internal st[] Keys  
+   A dump of the plugin’s in‑memory dict for this load (sorted keys) to surface hidden values (e.g., `cooldown_start`, `catchup_run_secs`, `quota_anchor_ts`).
+
+### Scheduler Table Column Legend (Appears Separately in Debug Logs)
+
+| Column     | Meaning |
+|------------|---------|
+| Tier       | Priority tier (1 = highest). |
+| Load       | Device name. |
+| Rated W    | Configured ratedWatts. |
+| Status     | ✓ RUN or ✗ OFF (emoji then word). |
+| Time Run   | `RuntimeWindowMins` (cosmetic current-window minutes). |
+| Rem Mins   | `RemainingQuotaMins` (preferred window allowance left). |
+| Watts      | Estimated Watts required to START (rated * surge * margin). |
+| Catch-up   | Off / Met / ACT Xm / Need Xm (see catch-up legend above). |
+| Action     | START / KEEP / STOP / SKIP (·) with icon. |
+
+Status & Action Icons:
+- ✓ RUN / ✗ OFF: Running state indicator.
+- ⚡ START: Started this tick.
+- ▶ KEEP: Stayed running.
+- ■ STOP: Stopped this tick.
+- · SKIP: Ineligible; reason encoded in parenthesis in debug lines (and Action cell uses SKIP).
+
+### Catch-up Descriptor Quick Reference
+
+| String    | When Shown |
+|-----------|------------|
+| Off       | Catch‑up disabled or target <= 0. |
+| Met       | Target > 0 and deficit already satisfied (remaining = 0). |
+| ACT Xm    | Catch‑up logic started the device; X = remaining minutes to satisfy fallback. |
+| Need Xm   | Deficit exists but conditions (window/concurrency/etc.) not yet met for catch‑up start. |
+
+### Enabling Debug Level 7
+
+In plugin preferences:
+1. Set the overall log level high enough (e.g. DEBUG / 5).
+2. Check the `debug7` (or “Debug Level 7”) flag.
+3. Save. The next scheduler tick will emit one DBG7 block per enabled SmartSolar Load device.
+
+Disable `debug7` after troubleshooting; it is intentionally verbose and can flood logs on short tick intervals.
+
+### Diagnosing Common Issues with DBG7 Output
+
+| Symptom | DBG7 Clues | Likely Cause |
+|---------|------------|--------------|
+| Load never STARTS | Action always SKIP (quota/headroom/window) | Quota consumed; insufficient headroom; outside time/DOW window; cooldown not met; concurrency cap. |
+| Load STARTS then STOPs quickly | STOP reason shows headroom low; run minutes < min runtime? | Headroom dipped below threshold AND min runtime already satisfied. Increase hysteresis or keep margin. |
+| Catch-up never activates | Catch-up Str “Need Xm” but outside window or concurrency saturated | Ensure window times, concurrency, and remaining fallback > 0. |
+| Catch-up does nothing though target set | Catch-up Str “Met” and Remaining=0 | Device already achieved minimum via normal runtime. |
+| Percent stuck at 100% across restart | Anchor refreshed & Served == max; window not rolled yet | Normal if full allowance consumed; rolls over when horizon passes (or after manual adjustment). |
+
+### Interpreting Anchor & Rollover
+
+- `quota_anchor_ts` marks when the current preferred window began.
+- On rollover (window length elapsed), the plugin resets:
+  - `served_quota_mins` → 0
+  - `RemainingQuotaMins` → full target
+  - `RuntimeWindowMins` → 0
+  - Catch-up runtime counters → 0
+- If you restart after fully consuming the window, hydrate may clamp & optionally refresh the anchor to avoid showing a phantom immediate rollover on first tick.
+
+### Performance Notes
+
+- Debug 7 logging formats an extended multi-line block per load per tick; on very short intervals consider disabling after capturing the needed trace.
+- The output is intentionally wide-character (box drawing + emoji). When exporting logs to plain-text systems that strip Unicode, alignment may degrade.
+
+---
+
+If you have an example DBG7 block that feels ambiguous, open an issue including:
+- The exact block (copy/paste)
+- Expected vs observed behavior
+- Whether catch-up or quota changes happened recently
+
+We can expand the legend or clarify messages further.
+
+
+
 ---
 
 ## Examples
