@@ -370,20 +370,10 @@ class SolarSmartAsyncManager:
 
     def _update_runtime_progress(self, dev):
         """
-        Update both:
-          - RuntimeQuotaPct (integer 0–100)
-          - Status string embedding " (NN%)" after RUNNING/OFF
-
-        Logic:
-          used = internal served_quota_mins (authoritative)
-          target =
-             maxRuntimePerQuotaMins prop (if > 0)
-             else used + RemainingQuotaMins (if that state exists and >= 0)
-          pct = round(used / target * 100) clamped 0–100
-          if target <= 0 => pct = 0
-
-        Minimal churn: only pushes updates when value actually changes.
-        Safe to call when device is disabled or OFF.
+        Update RuntimeQuotaPct and enriched Status string.
+        For inverted loads:
+          Logical RUNNING  -> CONSUMING (ECO OFF)
+          Logical NOT RUN  -> SAVING (ECO ON)
         """
         try:
             if dev.deviceTypeId != "solarsmartLoad":
@@ -391,23 +381,21 @@ class SolarSmartAsyncManager:
 
             props = dev.pluginProps or {}
 
-            # Authoritative used minutes from in-memory state
+            # Authoritative used minutes
             try:
                 used = int(self._served_quota_mins(dev))
             except Exception:
                 used = 0
 
-            # Determine target
+            # Target (preferred runtime allowance)
             try:
                 target_prop = int(props.get("maxRuntimePerQuotaMins") or 0)
             except Exception:
                 target_prop = 0
 
             remaining_state = dev.states.get("RemainingQuotaMins")
-            remaining = None
             try:
-                if remaining_state is not None:
-                    remaining = int(remaining_state)
+                remaining = int(remaining_state) if remaining_state is not None else None
             except Exception:
                 remaining = None
 
@@ -416,40 +404,30 @@ class SolarSmartAsyncManager:
             elif remaining is not None and remaining >= 0:
                 target = used + remaining
             else:
-                target = 0  # no meaningful target
+                target = 0
 
             if target > 0:
                 pct = int(round((float(used) / float(target)) * 100.0))
             else:
                 pct = 0
+            pct = max(0, min(100, pct))
 
-            if pct < 0:
-                pct = 0
-            elif pct > 100:
-                pct = 100
-
-            # Update dedicated pct state if changed
-            cur_pct = dev.states.get("RuntimeQuotaPct")
-            if cur_pct != pct:
+            if dev.states.get("RuntimeQuotaPct") != pct:
                 dev.updateStateOnServer("RuntimeQuotaPct", pct)
 
-            # Embed percent in Status
-            base_status = "RUNNING" if self._is_running(dev) else "OFF"
+            inverted = bool(props.get("invertOnOff", False))
+            is_run = self._is_running(dev)
 
-            # --- INSERT (augment status when inverted) ---
-            inverted = bool((dev.pluginProps or {}).get("invertOnOff", False))
             if inverted:
-                # Logical RUNNING = physical OFF (ECO disabled; consuming)
-                # Logical OFF     = physical ON  (ECO enabled; saving)
-                eco_phrase = "ECO OFF" if self._is_running(dev) else "ECO ON"
-                base_status = f"{base_status} ({eco_phrase})"
-            # --- END INSERT ---
+                # Logical running = consuming (physical OFF / ECO disabled)
+                base_word = "CONSUMING" if is_run else "SAVING"
+                eco_phrase = "ECO OFF" if is_run else "ECO ON"
+                base_status = f"{base_word} ({eco_phrase})"
+            else:
+                base_status = "RUNNING" if is_run else "OFF"
 
-
-            existing_status = dev.states.get("Status", "")
-            # Strip any existing trailing " (NN%)"
             new_status = f"{base_status} ({pct}%)"
-            if existing_status != new_status:
+            if dev.states.get("Status", "") != new_status:
                 dev.updateStateOnServer("Status", new_status)
 
         except Exception:
@@ -1472,16 +1450,6 @@ class SolarSmartAsyncManager:
                            running_now):
         """
         Deep per-device diagnostic dump (debug7).
-        Produces a single multi-line INFO block (readable) containing:
-          • Decision context
-          • Preferred (window/"quota") runtime counters
-          • Catch-up status
-          • External / control linkage
-          • Power / thresholds
-          • Concurrency snapshot
-          • Raw internal st[] keys (sorted) for unexpected values
-
-        Only emitted when plugin.debug7 is True.
         """
         if not getattr(self.plugin, "debug7", False):
             return
@@ -1489,17 +1457,8 @@ class SolarSmartAsyncManager:
         try:
             st = self.plugin._load_state.get(dev.id, {}) or {}
             props = dev.pluginProps or {}
-            ext_on = self.plugin._external_on_state(dev)
-
-            # Choose log level (switch to .debug if you prefer quieter)
+            logical_on = self.plugin._external_on_state(dev)  # already inverted if invertOnOff
             log_func = self.plugin.logger.info
-
-            # Friendly helpers
-            def _pint(v):
-                try:
-                    return int(v)
-                except Exception:
-                    return v
 
             rated = 0
             try:
@@ -1533,7 +1492,6 @@ class SolarSmartAsyncManager:
             rem_dev = dev.states.get("RemainingQuotaMins")
             run_window_dev = dev.states.get("RuntimeWindowMins")
 
-            # Time conversions
             def _fmt_ts(ts):
                 if not ts:
                     return "—"
@@ -1542,55 +1500,10 @@ class SolarSmartAsyncManager:
                 except Exception:
                     return str(ts)
 
-            # Raw internal state key dump (sorted)
-            raw_state_lines = []
-            for k in sorted(st.keys()):
-                raw_state_lines.append(f"    {k}: {st.get(k)!r}")
-
-            block = []
-            block.append("")
-            block.append(f"════════════════════════════════════════════════════════════════════════════════")
-            block.append(f"🔍 DBG7 Device: {dev.name}  (id={dev.id})  Tier {tier}")
-            block.append(f"════════════════════════════════════════════════════════════════════════════════")
-
-            # Decision
-            block.append(f"🧠 Decision")
-            block.append(f"    Status: {status}   Action: {action}   Skip: {skip_reason or '—'}")
-            block.append(f"    Headroom Now: {headroom} W   StartsThisTick: {starts_this_tick}   RunningNow: {running_now}")
-
-            # Preferred window (window/quota) runtime
-            block.append(f"⏱️ Preferred Window Runtime")
-            block.append(f"    Served (internal): {served_quota} min   Window Run (state): {run_window_dev} min")
-            block.append(f"    Remaining (state): {rem_dev} min   Remaining (shown row): {remaining} min")
-            block.append(f"    Used (state RuntimeQuotaMins): {run_quota_dev} min   Percent: {pct}%")
-            block.append(f"    Anchor Start (ts): {anchor_ts} ({_fmt_ts(anchor_ts)})")
-
-            # Catch-up
-            block.append(f"🛟 Catch-up / Fallback")
-            block.append(f"    Active: state={catch_active_state} / mem={catch_active_st}   Catch-up Str Col: {catchup}")
-            block.append(f"    Target: {catch_target} min   Remaining: {catch_remaining} min")
-            block.append(f"    Run Today (state): {catch_run_today} min   Run (active secs mem): {catch_run_secs} s")
-            block.append(f"    Window: {props.get('catchupWindowStart','??')} - {props.get('catchupWindowEnd','??')}   Enabled: {props.get('enableCatchup')}")
-
-            # External / control
-            block.append(f"🔌 External / Control")
-            block.append(f"    External Device On: {ext_on}   IsRunning(state): {dev.states.get('IsRunning')}")
-            block.append(f"    Start Ts: {start_ts} ({_fmt_ts(start_ts)})   Cooldown Start: {cooldown_start} ({_fmt_ts(cooldown_start)})")
-            block.append(f"    Control Mode: {props.get('controlMode')}   Cooldown Mins: {cooldown_mins}")
-
-            # Power & thresholds
-            block.append(f"⚡ Power & Thresholds")
-            block.append(f"    Rated: {rated} W   Needed (start threshold est): {needed_w} W")
-            block.append(f"    Surge Mult: {surge_mult}   Start Margin %: {start_margin_pct}   Keep Margin %: {keep_margin_pct}")
-            block.append(f"    Min Runtime: {min_run} min   Max Runtime (per start run): {max_run} min   Max Pref Window: {max_pref} min")
-            block.append(f"    Quota Window Config: {quota_window}")
-
-            # ext_on here is the LOGICAL state (already inverted when invertOnOff=True)
-            logical_on = ext_on
+            # Compute physical_on (if device mode)
             physical_on = None
             try:
-                props_mode = (props.get("controlMode") or "").lower()
-                if props_mode == "device":
+                if (props.get("controlMode") or "").lower() == "device":
                     tgt_id = int(props.get("controlDeviceId", 0) or 0)
                     if tgt_id and tgt_id in indigo.devices:
                         tgt_dev = indigo.devices[tgt_id]
@@ -1599,14 +1512,49 @@ class SolarSmartAsyncManager:
                         except Exception:
                             physical_on = bool(tgt_dev.states.get("onOffState", False))
             except Exception:
-                pass
+                physical_on = None
 
             inverted = bool(props.get("invertOnOff", False))
-            block.append(f"🔌 External / Control")
+
+            # Adjust target/rem display if catch-up disabled
+            enabled_cu = bool(props.get("enableCatchup", False))
+            if not enabled_cu:
+                display_cu_target = 0
+                display_cu_remaining = 0
+            else:
+                display_cu_target = catch_target
+                display_cu_remaining = catch_remaining
+
+            # Raw internal state key dump
+            raw_state_lines = [f"    {k}: {st.get(k)!r}" for k in sorted(st.keys())]
+
+            block = []
+            block.append("")
+            block.append("════════════════════════════════════════════════════════════════════════════════")
+            block.append(f"🔍 DBG7 Device: {dev.name}  (id={dev.id})  Tier {tier}")
+            block.append("════════════════════════════════════════════════════════════════════════════════")
+
+            block.append("🧠 Decision")
+            block.append(f"    Status: {status}   Action: {action}   Skip: {skip_reason or '—'}")
+            block.append(
+                f"    Headroom Now: {headroom} W   StartsThisTick: {starts_this_tick}   RunningNow: {running_now}")
+
+            block.append("⏱️ Preferred Window Runtime")
+            block.append(f"    Served (internal): {served_quota} min   Window Run (state): {run_window_dev} min")
+            block.append(f"    Remaining (state): {rem_dev} min   Remaining (shown row): {remaining} min")
+            block.append(f"    Used (state RuntimeQuotaMins): {run_quota_dev} min   Percent: {pct}%")
+            block.append(f"    Anchor Start (ts): {anchor_ts} ({_fmt_ts(anchor_ts)})")
+
+            block.append("🛟 Catch-up / Fallback")
+            block.append(
+                f"    Active: state={catch_active_state} / mem={catch_active_st}   Catch-up Str Col: {catchup}")
+            block.append(f"    Target: {display_cu_target} min   Remaining: {display_cu_remaining} min")
+            block.append(f"    Run Today (state): {catch_run_today} min   Run (active secs mem): {catch_run_secs} s")
+            block.append(
+                f"    Window: {props.get('catchupWindowStart', '??')} - {props.get('catchupWindowEnd', '??')}   Enabled: {enabled_cu}")
+
+            block.append("🔌 External / Control")
             if inverted:
-                # Show both physical and logical with explicit ECO semantics
-                # Physical ON  = ECO ON (saving) => logical OFF
-                # Physical OFF = ECO OFF (consuming) => logical ON
                 block.append(
                     f"    Physical Device On: {physical_on} (ECO {'ON' if physical_on else 'OFF'})   "
                     f"Logical Running: {logical_on}"
@@ -1622,19 +1570,24 @@ class SolarSmartAsyncManager:
                 f"    Control Mode: {props.get('controlMode')}   Cooldown Mins: {cooldown_mins}"
             )
 
+            block.append("⚡ Power & Thresholds")
+            block.append(f"    Rated: {rated} W   Needed (start threshold est): {needed_w} W")
+            block.append(
+                f"    Surge Mult: {surge_mult}   Start Margin %: {start_margin_pct}   Keep Margin %: {keep_margin_pct}")
+            block.append(
+                f"    Min Runtime: {min_run} min   Max Runtime (per start run): {max_run} min   Max Pref Window: {max_pref} min")
+            block.append(f"    Quota Window Config: {quota_window}")
 
-            # Concurrency
-            block.append(f"📦 Concurrency Snapshot")
+            block.append("📦 Concurrency Snapshot")
             block.append(f"    Running Now: {running_now}   Starts This Tick: {starts_this_tick}")
 
-            # Raw internal dict
-            block.append(f"🗂️ Raw Internal st[] Keys")
+            block.append("🗂️ Raw Internal st[] Keys")
             if raw_state_lines:
                 block.extend(raw_state_lines)
             else:
                 block.append("    (empty)")
 
-            block.append(f"────────────────────────────────────────────────────────────────────────────────")
+            block.append("────────────────────────────────────────────────────────────────────────────────")
 
             log_func("\n".join(block))
 
@@ -2093,19 +2046,23 @@ class SolarSmartAsyncManager:
 
     def _mark_running(self, dev: indigo.Device, running: bool):
         st = self.plugin._load_state.setdefault(dev.id, {})
+        props = dev.pluginProps or {}
+        inverted = bool(props.get("invertOnOff", False))
         if running:
             now = time.time()
             st["start_ts"] = now
-            st["IsRunning"] = True  # mirror
+            st["IsRunning"] = True
             dev.updateStateOnServer("LastStartTs", f"{now:.3f}")
             dev.updateStateOnServer("IsRunning", True)
-            dev.updateStateOnServer("Status", "RUNNING")
+            status_word = "CONSUMING" if inverted else "RUNNING"  # Inverted logical ON = consuming (physical OFF)
+            dev.updateStateOnServer("Status", status_word)
         else:
             st["start_ts"] = None
-            st["IsRunning"] = False  # mirror
+            st["IsRunning"] = False
             dev.updateStateOnServer("LastStartTs", "")
             dev.updateStateOnServer("IsRunning", False)
-            dev.updateStateOnServer("Status", "OFF")
+            status_word = "SAVING" if inverted else "OFF"          # Inverted logical OFF = saving (physical ON)
+            dev.updateStateOnServer("Status", status_word)
 
     def _served_quota_mins(self, dev: indigo.Device) -> int:
         st = self.plugin._load_state.setdefault(dev.id, {})
@@ -2930,15 +2887,16 @@ class Plugin(indigo.PluginBase):
                             ext_on = bool(ext.states.get("onOffState", False))
             except Exception:
                 ext_on = None
-
+            inverted = bool(props.get("invertOnOff", False))
             if ext_on is not None:
-                inverted = bool(props.get("invertOnOff", False))
+
                 logical_on = (not ext_on) if inverted else bool(ext_on)
 
                 st["IsRunning"] = logical_on
                 if logical_on:
                     dev.updateStateOnServer("IsRunning", True)
-                    dev.updateStateOnServer("Status", "RUNNING")
+                    status_word = "CONSUMING" if inverted else "RUNNING"
+                    dev.updateStateOnServer("Status", status_word)
                     dev.updateStateOnServer("LastReason", "Hydrate from external onOffState")
                     # Seed start_ts if device ON but we had none
                     if not st.get("start_ts"):
@@ -2950,12 +2908,14 @@ class Plugin(indigo.PluginBase):
                                 f"Hydrate: seeded start_ts for {dev.name} because external device is ON without persisted LastStartTs")
                 else:
                     dev.updateStateOnServer("IsRunning", False)
-                    dev.updateStateOnServer("Status", "OFF")
+                    status_word = "SAVING" if inverted else "OFF"
+                    dev.updateStateOnServer("Status", status_word)
                     dev.updateStateOnServer("LastReason", "Hydrate from external onOffState")
             else:
                 st["IsRunning"] = False
                 dev.updateStateOnServer("IsRunning", False)
-                dev.updateStateOnServer("Status", "OFF")
+                status_word = "SAVING" if inverted else "OFF"
+                dev.updateStateOnServer("Status", status_word)
                 if not dev.states.get("LastReason"):
                     dev.updateStateOnServer("LastReason", "Plugin restart recovery")
 
@@ -3717,13 +3677,19 @@ class Plugin(indigo.PluginBase):
             if update_states:
                 load_dev.updateStateOnServer("IsRunning", turn_on)
                 load_dev.updateStateOnServer("LastReason", reason)
-                load_dev.updateStateOnServer("Status", "RUNNING" if turn_on else "OFF")
-                # Immediately replace plain RUNNING/OFF with percentage form
+                inverted = bool((props or {}).get("invertOnOff", False))
+                if inverted:
+                    # Logical turn_on=True => consuming; False => saving
+                    status_word = "CONSUMING" if turn_on else "SAVING"
+                else:
+                    status_word = "RUNNING" if turn_on else "OFF"
+                load_dev.updateStateOnServer("Status", status_word)
                 try:
                     if hasattr(self, "_ss_manager"):
                         self._ss_manager._update_runtime_progress(load_dev)
                 except Exception:
                     pass
+
 
         except Exception as e:
             self.logger.error(f"Error executing action for {load_dev.name}: {e}")
