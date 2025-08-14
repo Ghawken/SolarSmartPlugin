@@ -346,35 +346,27 @@ class SolarSmartAsyncManager:
 
     def _sync_running_flags_from_external(self, loads_by_tier: dict[int, list[indigo.Device]]):
         """
-        For loads controlled by Indigo devices (not action groups), mirror the *actual*
-        device on/off (onOffState) into the SmartSolar load's IsRunning flag.
-        No actions are sent here; we only correct flags so the scheduler can make decisions.
+        Mirror external device logical ON/OFF (already inverted inside _external_on_state)
+        into IsRunning. No physical commands are sent here.
         """
         for tier, devs in loads_by_tier.items():
             for d in devs:
-                ext_on = self.plugin._external_on_state(d)  # helper is in plugin
-                # --- INSERT (ensure inversion honored even if _external_on_state not updated) ---
-                props = d.pluginProps or {}
-                if ext_on is not None and props.get("invertOnOff", False):
-                    ext_on = not bool(ext_on)
-                    if getattr(self.plugin, "debug8", False):
-                        self.plugin.logger.debug(f"[DBG8][sync] {d.name} invertOnOff=True -> logical_on={ext_on}")
-                if ext_on is None:
-                    continue  # no onOffState, likely action group controlled
-
-                if self._is_running(d) != bool(ext_on):
-                    self._mark_running(d, bool(ext_on))
-                    d.updateStateOnServer("LastReason", "Sync from external onOffState")
-
-                    # Info log on change
-                    state_str = "ON" if ext_on else "OFF"
+                ext_logical = self.plugin._external_on_state(d)  # returns logical (inversion already applied)
+                if ext_logical is None:
+                    continue  # action group mode or invalid
+                if self._is_running(d) != bool(ext_logical):
+                    self._mark_running(d, bool(ext_logical))
+                    d.updateStateOnServer("LastReason", "Sync from external device")
+                    state_str = "ON" if ext_logical else "OFF"
                     self.plugin.logger.info(
-                        f"External state change detected for '{d.name}': now {state_str} "
-                        f"(mirrored into IsRunning)"
+                        f"External state change detected for '{d.name}': now {state_str} (mirrored into IsRunning)"
                     )
+                    if getattr(self.plugin, "debug8", False):
+                        self.plugin.logger.debug(f"[DBG8][sync] {d.name} mirrored logical_on={ext_logical}")
+                elif getattr(self.plugin, "debug8", False):
+                    # Optional trace showing no change needed
+                    self.plugin.logger.debug(f"[DBG8][sync] {d.name} no change (logical_on={ext_logical})")
 
-                    if getattr(self.plugin, "debug2", False):
-                        self.plugin.logger.debug(f"Tick sync: {d.name} IsRunning <- {ext_on}")
 
     def _update_runtime_progress(self, dev):
         """
@@ -443,6 +435,17 @@ class SolarSmartAsyncManager:
 
             # Embed percent in Status
             base_status = "RUNNING" if self._is_running(dev) else "OFF"
+
+            # --- INSERT (augment status when inverted) ---
+            inverted = bool((dev.pluginProps or {}).get("invertOnOff", False))
+            if inverted:
+                # Logical RUNNING = physical OFF (ECO disabled; consuming)
+                # Logical OFF     = physical ON  (ECO enabled; saving)
+                eco_phrase = "ECO OFF" if self._is_running(dev) else "ECO ON"
+                base_status = f"{base_status} ({eco_phrase})"
+            # --- END INSERT ---
+
+
             existing_status = dev.states.get("Status", "")
             # Strip any existing trailing " (NN%)"
             new_status = f"{base_status} ({pct}%)"
