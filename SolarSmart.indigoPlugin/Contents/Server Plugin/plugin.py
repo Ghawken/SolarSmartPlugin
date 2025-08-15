@@ -2232,7 +2232,7 @@ class SolarSmartAsyncManager:
             # PHYSICAL ACTUATION (needed for inverted devices to enter ECO / saving mode)
             # update_states=False to avoid temporarily overwriting logical state before we mark_running(False)
             try:
-                self._execute_load_action(dev, turn_on=False, reason=reason, update_states=False)
+                self.plugin._execute_load_action(dev, turn_on=False, reason=reason, update_states=False)
             except Exception:
                 pass
 
