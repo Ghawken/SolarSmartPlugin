@@ -44,7 +44,7 @@ from forecast_solar_service import ForecastSolarClient, PVPlane
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 Number = Union[int, float]
-
+import datetime as dt
 
 # ────────────────────────────────────────────────────────────
 # Small validators
@@ -1329,6 +1329,43 @@ class SolarSmartAsyncManager:
             window_min = self._quota_window_minutes(props)
             if window_min <= 0:
                 return
+
+            # ----- DAILY 06:00 RESET (once per local day) -----
+            local_now = dt.datetime.now()
+            today_str = local_now.strftime("%Y-%m-%d")
+            reset_dt = local_now.replace(hour=6, minute=0, second=0, microsecond=0)
+            # If we are at/after 06:00 and haven't done today's reset, perform it
+            if local_now >= reset_dt and st.get("day_reset_key") != today_str:
+                # Perform daily reset aligned to 06:00 exactly (not 'now')
+                reset_ts = reset_dt.timestamp()
+                st["day_reset_key"] = today_str
+                st["quota_anchor_ts"] = reset_ts
+                dev.updateStateOnServer("QuotaAnchorTs", f"{reset_ts:.3f}")
+
+                # Quota / runtime counters
+                st["served_quota_mins"] = 0
+                dev.updateStateOnServer("RuntimeQuotaMins", 0)
+                dev.updateStateOnServer("RuntimeWindowMins", 0)
+
+                # Catch-up counters
+                st["catchup_run_secs"] = 0.0
+                try:
+                    dev.updateStateOnServer("catchupRunTodayMins", 0)
+                    dev.updateStateOnServer("catchupRunWindowAccumMins", 0)
+                    dev.updateStateOnServer("catchupRemainingTodayMins", 0)   # recalculated next tick
+                    dev.updateStateOnServer("catchupActive", False)
+                except Exception:
+                    pass
+
+                # Refill RemainingQuotaMins from config
+                target = int(props.get("maxRuntimePerQuotaMins") or 0)
+                dev.updateStateOnServer("RemainingQuotaMins", max(0, target))
+
+                self.plugin.logger.info(
+                    f"06:00 daily reset for '{dev.name}': counters cleared; RemainingQuotaMins={target}."
+                )
+                return  # Daily reset done; do not also treat as elapsed-window rollover this tick.
+
 
             elapsed_min = int((now_ts - anchor) // 60)
             if elapsed_min < window_min:
