@@ -674,7 +674,10 @@ class SolarSmartAsyncManager:
                     st = self.plugin._load_state.setdefault(d.id, {})
                     if "catchup_run_secs" not in st:
                         st["catchup_run_secs"] = 0.0
-
+                    # Auto-clear stale catchup_active if device is actually OFF
+                    if st.get("catchup_active") and not self._is_running(d):
+                        st["catchup_active"] = False
+                        d.updateStateOnServer("catchupActive", False)
                     # Config target
                     try:
                         catchup_runtime = int(props.get("catchupRuntimeMins") or 0)
@@ -1387,11 +1390,25 @@ class SolarSmartAsyncManager:
 
             props = dev.pluginProps or {}
             reason: str | None = None
-
+            # Catch-up override context
+            catchup_override = False
+            try:
+                if bool(props.get("enableCatchup", False)):
+                    # Are we in catch-up window AND deficit remains?
+                    cu_start = self._parse_hhmm(props.get("catchupWindowStart", "00:00"))
+                    cu_end = self._parse_hhmm(props.get("catchupWindowEnd", "06:00"))
+                    now_time = now.time()
+                    if self._time_in_window(now_time, cu_start, cu_end):
+                        cu_target = int(props.get("catchupRuntimeMins") or 0)
+                        served = self._served_quota_mins(dev)
+                        if cu_target > served:
+                            catchup_override = True  # permit run even outside normal window/DOW
+            except Exception:
+                catchup_override = False
             # Determine reason (first-match)
-            if not _dow_allowed(props, now):
+            if not _dow_allowed(props, now) and not catchup_override:
                 reason = "window (DOW)"
-            elif not _time_window_allowed(props, now):
+            elif not _time_window_allowed(props, now) and not catchup_override:
                 reason = "window (time)"
             else:
                 remaining = self._quota_remaining_mins(dev, props, now)
@@ -1999,8 +2016,15 @@ class SolarSmartAsyncManager:
                 rated = int(float((dev.pluginProps or {}).get("ratedWatts", 0)) or 0)
             except Exception:
                 rated = 0
-            if self._is_running(dev) and rated > 0:
-                candidates.append((tier, dev, rated))
+            if not self._is_running(dev) or rated <= 0:
+                continue
+            # Skip if catch-up active to avoid undoing fallback start
+            st = self.plugin._load_state.get(dev.id, {})
+            if st.get("catchup_active"):
+                if getattr(self.plugin, "debug2", False):
+                    self.plugin.logger.debug(f"_shed_until_positive: skip shedding (catch-up active) {dev.name}")
+                continue
+            candidates.append((tier, dev, rated))
 
         if not candidates:
             if dbg:
@@ -2239,6 +2263,16 @@ class SolarSmartAsyncManager:
             self._mark_running(dev, False)
             dev.updateStateOnServer("LastReason", reason)
             self._update_runtime_progress(dev)
+
+            # Clear catch-up active flag if set
+            st = self.plugin._load_state.setdefault(dev.id, {})
+            if st.get("catchup_active"):
+                st["catchup_active"] = False
+                try:
+                    dev.updateStateOnServer("catchupActive", False)
+                    dev.updateStateOnServer("catchupLastStop", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                except Exception:
+                    pass
             # Always log OFF at INFO
             ran_txt = ""
             if ran_secs is not None:
