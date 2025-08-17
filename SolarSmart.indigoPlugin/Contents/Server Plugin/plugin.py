@@ -1447,6 +1447,14 @@ class SolarSmartAsyncManager:
         if remaining <= 0:
             return "Quota exhausted"
 
+        # If this load is in catch-up mode, ignore headroom stop logic
+        st = self.plugin._load_state.get(dev.id, {})
+        if st.get("catchup_active"):
+            return None
+
+        # Headroom sustain check
+        ...
+
         # Headroom sustain check (simple + tiny hysteresis)
         try:
             rated = int(float(props.get("ratedWatts", 0)) or 0)
