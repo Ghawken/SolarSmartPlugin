@@ -1,6 +1,6 @@
 # SolarSmart Indigo Plugin
 
-![Main Device Setup](https://github.com/Ghawken/SolarSmartPlugin/blob/main/Resources/icon.png?raw=true "SolarSmart Main Device (Controller)")
+![](https://github.com/Ghawken/SolarSmartPlugin/blob/main/SolarSmart.indigoPlugin/Resources/icon.png?raw=true "SolarSmart Plugin Icon")
 
 Harness your surplus solar energy automatically. SolarSmart monitors your photovoltaic (PV) production, site consumption, battery power, and/or net grid flow to calculate “headroom” (excess power) and then starts or sheds discretionary loads in a priority order so you use more of your own clean energy and import less from the grid.
 
