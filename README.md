@@ -168,6 +168,9 @@ Note: Field names may vary slightly by version.
 
 ### Test Device (Simulation)
 
+![Test Device Setup](https://github.com/Ghawken/SolarSmartPlugin/blob/main/Images/TestDevice.png?raw=true "SolarSmart Test Device (Controller)")
+
+
 - Provide simulated values for PV, consumption, battery, and/or net grid.
 - Use to validate tier scheduling, quotas, and shed behavior without risking real loads.
 
