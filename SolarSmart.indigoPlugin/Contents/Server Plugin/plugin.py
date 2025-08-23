@@ -1,4 +1,4 @@
-#! /usr/bin/env python2.6
+#! /usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
@@ -304,7 +304,7 @@ class SolarSmartAsyncManager:
 
         # Main 30s ticker (pv/consumption/battery -> publish states)
         #self._tasks.append(self.loop.create_task(self._ticker_main_states(period_sec=30.0)))
-        asyncio.sleep(5)
+        await asyncio.sleep(5)
         self._track_task(self._ticker_main_states(period_sec=30.0), "main_states")
         self._track_task(self._ticker_load_scheduler(period_min=self.plugin.time_for_checks_frequency),
                          "load_scheduler")
@@ -784,6 +784,16 @@ class SolarSmartAsyncManager:
                         if dbg5:
                             self.plugin.logger.debug(
                                 f"[CATCHUP][SKIP] {d.name}: outside window remaining={remaining_fallback}m"
+                            )
+                        continue
+
+                    # NEW: respect cooldown for catch-up starts
+                    cooldown_ok = self._cooldown_met(d, int(props.get("cooldownMins") or 0))
+                    if not cooldown_ok:
+                        total_skipped += 1
+                        if dbg5:
+                            self.plugin.logger.debug(
+                                f"[CATCHUP][SKIP] {d.name}: cooldown not met"
                             )
                         continue
 
@@ -1512,8 +1522,19 @@ class SolarSmartAsyncManager:
                            running_now):
         """
         Deep per-device diagnostic dump (debug7).
+        Only emits when:
+          - plugin.debug7 is True, AND
+          - IndigoLogHandler level is DEBUG or lower (<= DEBUG)
         """
+        # Require explicit opt-in AND Indigo UI log level at DEBUG (or more verbose)
         if not getattr(self.plugin, "debug7", False):
+            return
+        try:
+            indigo_handler = getattr(self.plugin, "indigo_log_handler", None)
+            import logging as _logging  # local alias to avoid shadowing
+            if not indigo_handler or indigo_handler.level > _logging.DEBUG:
+                return
+        except Exception:
             return
 
         try:
@@ -1831,7 +1852,7 @@ class SolarSmartAsyncManager:
                     action = "SKIP (quota)"
                     status = "OFF"
                 elif not self._cooldown_met(d, int(props.get("cooldownMins") or 0)):
-                    action = "SKIP (cooldownn)"
+                    action = "SKIP (cooldown)"
                     status = "OFF"
                 elif headroom_w >= needed_w:
                     # Start exactly ONE load per tick
@@ -2117,10 +2138,12 @@ class SolarSmartAsyncManager:
         st = self.plugin._load_state.setdefault(dev.id, {})
         props = dev.pluginProps or {}
         inverted = bool(props.get("invertOnOff", False))
+        now = time.time()
         if running:
             now = time.time()
             st["start_ts"] = now
             st["IsRunning"] = True
+            st.pop("cooldown_start", None)
             dev.updateStateOnServer("LastStartTs", f"{now:.3f}")
             dev.updateStateOnServer("IsRunning", True)
             status_word = "CONSUMING" if inverted else "RUNNING"  # Inverted logical ON = consuming (physical OFF)
@@ -2128,6 +2151,7 @@ class SolarSmartAsyncManager:
         else:
             st["start_ts"] = None
             st["IsRunning"] = False
+            st["cooldown_start"] = now
             dev.updateStateOnServer("LastStartTs", "")
             dev.updateStateOnServer("IsRunning", False)
             status_word = "SAVING" if inverted else "OFF"          # Inverted logical OFF = saving (physical ON)
@@ -2658,20 +2682,23 @@ class Plugin(indigo.PluginBase):
         except Exception:
             return default
 
-    def _log_effective_source_summary(self):
+    # Replace the signature and top of this method to accept overrides and merge them
+    def _log_effective_source_summary(self, *, main_props_override=None, test_props_override=None):
         """
         Log a plain-English summary for whichever source will be used:
         - Test device (if enabled), else
         - Main device
-        Includes current readings and the computed headroom.
+
+        Accepts optional overrides so logs reflect just-edited config (valuesDict) before Indigo writes pluginProps.
         """
         # Prefer enabled Test device
-        test_dev = next((d for d in indigo.devices
-                         if d.deviceTypeId == "solarsmartTest" and d.enabled), None)
+        test_dev = next((d for d in indigo.devices if d.deviceTypeId == "solarsmartTest" and d.enabled), None)
         if test_dev:
-            tprops = test_dev.pluginProps or {}
-            use_grid = bool(tprops.get("useGridHeadroom", False))
+            # Merge just-edited valuesDict over saved pluginProps (valuesDict wins)
+            saved = test_dev.pluginProps or {}
+            tprops = self._merge_props(test_props_override or {}, saved)
 
+            use_grid = bool(tprops.get("useGridHeadroom", False))
             pv_w = self._pint(tprops.get("pvTestW"), 0)
             cons_w = self._pint(tprops.get("consTestW"), None)
             batt_w = self._pint(tprops.get("battTestW"), None)
@@ -2715,16 +2742,16 @@ class Plugin(indigo.PluginBase):
             self.logger.info(u"{0:=^130}".format(""))
             return  # done
 
-        # Otherwise, log Main device config if present
-        main = next((d for d in indigo.devices
-                     if d.deviceTypeId == "solarsmartMain" and d.enabled), None)
+        # Otherwise, log Main device config if present (merge override if provided)
+        main = next((d for d in indigo.devices if d.deviceTypeId == "solarsmartMain" and d.enabled), None)
         if not main:
             return
 
-        props = main.pluginProps or {}
+        saved_main = main.pluginProps or {}
+        props = self._merge_props(main_props_override or {}, saved_main)
+
         use_grid = bool(props.get("useGridHeadroom", False))
 
-        # Pull readings using your existing readers that accept props
         grid_w = None
         if use_grid and hasattr(self, "read_grid_watts"):
             try:
@@ -2746,14 +2773,14 @@ class Plugin(indigo.PluginBase):
                 batt_adj = max(0.0, float(batt_w)) if batt_w is not None else 0
                 headroom = int(round(pv_w - cons_w - batt_adj))
 
-        # Log banner
         self.logger.info(u"{0:=^130}".format(""))
         self.logger.info("🔌🔌 SolarSmart Setup 🔌🔌")
         self.logger.info("")
         if use_grid and grid_w is not None:
             flow_desc = "⚡ Importing from grid" if grid_w > 0 else (
                 "🔋 Exporting to grid" if grid_w < 0 else "➖ Balanced (no net flow)")
-            self.logger.info("Mode: Net Grid mode only — Net grid power will be the only factor in headroom calculations.")
+            self.logger.info(
+                "Mode: Net Grid mode only — Net grid power will be the only factor in headroom calculations.")
             self.logger.info("(This is likely the most accurate, if your Meters support it)")
             self.logger.info("This means PV, battery, and site consumption values are reported but ignored.")
             self.logger.info(f"Current grid reading: {grid_w} W → {flow_desc}")
@@ -2783,7 +2810,7 @@ class Plugin(indigo.PluginBase):
             except Exception:
                 return valuesDict
             # Always show what will be used effectively
-            self._log_effective_source_summary()
+            self._log_effective_source_summary(test_props_override=valuesDict)
             return valuesDict
 
         if typeId != "solarsmartMain":
@@ -2794,8 +2821,8 @@ class Plugin(indigo.PluginBase):
         except Exception:
             return valuesDict
 
-        # Always show what will be used effectively
-        self._log_effective_source_summary()
+            # Log using the just-edited config (valuesDict) before Indigo persists pluginProps
+        self._log_effective_source_summary(main_props_override=valuesDict)
 
         # Refresh states immediately if not cancelled
         if not userCancelled:
@@ -2901,6 +2928,20 @@ class Plugin(indigo.PluginBase):
         st = self._load_state.setdefault(dev.id, {})
 
         try:
+            # NEW: ensure Tier and PowerRated are set from props
+            props = dev.pluginProps or {}
+            try:
+                tier_val = int(props.get("tier", 2) or 2)
+            except Exception:
+                tier_val = 2
+            try:
+                rated_val = int(float(props.get("ratedWatts", 0)) or 0)
+            except Exception:
+                rated_val = 0
+            dev.updateStateOnServer("Tier", tier_val)
+            dev.updateStateOnServer("PowerRated", rated_val)
+
+
             # --- Persisted counters / anchors ---
             st["served_quota_mins"] = int(dev.states.get("RuntimeQuotaMins", 0) or 0)
 
@@ -4184,6 +4225,7 @@ class Plugin(indigo.PluginBase):
 
     _NUM_RE = re.compile(r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)")
 
+    @staticmethod
     def _parse_to_watts(s: str) -> Optional[Number]:
         """
         Extract the first number and unit from a string and convert to Watts.
@@ -4201,7 +4243,7 @@ class Plugin(indigo.PluginBase):
             return None
 
         s_clean = s.replace(",", "").strip()
-        m = _NUM_RE.search(s_clean)
+        m = Plugin._NUM_RE.search(s_clean)
         if not m:
             return None
 

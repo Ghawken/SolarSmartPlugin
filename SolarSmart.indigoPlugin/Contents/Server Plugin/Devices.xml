@@ -52,7 +52,7 @@
         <Description> Use Grid usage + / - as only factor in load</Description>
     </Field>
       <Field id="gridHeader" type="label" fontColor="black" fontSize="medium">
-        <Label>Grid Power (Watts; + = charging, − = discharging)</Label>
+        <Label>Grid Power (Watts; + = charging, − = exporting)</Label>
       </Field>
 
       <Field id="gridDeviceId" type="menu" defaultValue="">
@@ -522,22 +522,6 @@ If this amount is already met in Runtime above, no CatchUp will occur.</Label>
       <TriggerLabel>Last decision reason changed</TriggerLabel>
       <ControlPageLabel>Reason</ControlPageLabel>
     </State>
-      <State id="RuntimeQuotaMins">
-    <ValueType>Integer</ValueType>
-    <TriggerLabel>Quota Minutes Used</TriggerLabel>
-    <ControlPageLabel>Quota Minutes Used</ControlPageLabel>
-  </State>
-  <State id="RemainingQuotaMins">
-    <ValueType>Integer</ValueType>
-    <TriggerLabel>Quota Minutes Remaining</TriggerLabel>
-    <ControlPageLabel>Quota Minutes Remaining</ControlPageLabel>
-  </State>
-  <State id="RuntimeWindowMins">
-    <ValueType>Integer</ValueType>
-    <TriggerLabel>Window Runtime Minutes</TriggerLabel>
-    <ControlPageLabel>Window Runtime Minutes</ControlPageLabel>
-  </State>
-
   <!-- Timestamps we persist across restarts -->
   <State id="QuotaAnchorTs">
     <ValueType>String</ValueType>
@@ -556,12 +540,27 @@ If this amount is already met in Runtime above, no CatchUp will occur.</Label>
     <Name>SolarSmart Test Source</Name>
 
     <ConfigUI>
-      <Field id="warn" type="label" fontColor="orange" fontSize="medium" alwaysUseInDialogHeightCalc="true">
-        <Label>
+<!-- Replace the existing Test device warning label with this expanded version -->
+<Field id="warn" type="label" fontColor="blue" fontSize="medium" alwaysUseInDialogHeightCalc="true">
+  <Label>
 This Test device will OVERRIDE the SolarSmart Main readings (PV, Consumption, Battery)
 for testing purposes only. Disable or delete this device when finished.
-        </Label>
-      </Field>
+
+When enabled:
+• The PV/Consumption/Battery values entered below replace the Main device readings.
+• If "Use Grid Data Only" is checked AND "Grid Battery Power (W)" is provided,
+  the scheduler will use ONLY that grid value for decisions (Headroom = -GridTestW).
+  In this grid-only mode, PV/Consumption/Battery entries are ignored.
+
+Conventions:
+• Grid: Positive = importing (deficit), Negative = exporting (surplus).
+• Battery: Positive = charging (consumes headroom), Negative = discharging (adds headroom).
+
+Tips:
+• Leave a field blank to omit it (PV defaults to 0 if not provided).
+• Use this device temporarily for scenario testing, then disable/remove it to return to normal operation.
+  </Label>
+</Field>
 
       <Field id="pvTestW" type="textfield" defaultValue="0">
         <Label>Test Solar Production (W):</Label>
@@ -578,14 +577,29 @@ for testing purposes only. Disable or delete this device when finished.
         <Description>Positive = charging, Negative = discharging (optional)</Description>
       </Field>
 
-      <Field id="useGridHeadroom" type="checkbox" tooltip="Enabling will use Grid information as Net everything.">
+      <!-- Updated label/description explaining what enabling does, with +/- examples -->
+      <Field id="useGridHeadroom" type="checkbox" tooltip="When enabled, PV/Consumption/Battery test values are ignored; headroom = -Grid Power.">
         <Label>Use Grid Data Only:</Label>
-        <Description> Use Grid usage + / - as only factor in load decisions</Description>
-    </Field>
-      <Field id="gridTestW" type="textfield" defaultValue="">
-        <Label>Grid Battery Power (W):</Label>
-        <Description>Positive = importing power, Negative = exporting power</Description>
+        <Description></Description>
       </Field>
+    <Field id="useGridHeadroom_help" type="label" fontColor="blue" fontSize="small" alwaysUseInDialogHeightCalc="true">
+      <Label>
+When checked, the scheduler ignores the PV/Consumption/Battery test entries and uses only the Grid Power value
+to decide headroom. Convention: Positive = importing (deficit), Negative = exporting (surplus).
+Examples: +800 → importing 800 W (headroom = -800);  -1200 → exporting 1200 W (headroom = +1200).
+      </Label>
+    </Field>
+      <!-- Clarified label and richer description with examples -->
+      <Field id="gridTestW" type="textfield" defaultValue="">
+        <Label>Grid Power (W):</Label>
+        <Description></Description>
+      </Field>
+    <Field id="gridTestW_help" type="label" fontColor="blue" fontSize="small" alwaysUseInDialogHeightCalc="true">
+      <Label>
+Enter integer Watts. Positive = importing from grid (deficit), Negative = exporting to grid (surplus).
+Examples: -1200 (exporting 1.2 kW → headroom +1200), 800 (importing 0.8 kW → headroom -800).
+      </Label>
+    </Field>
 
     </ConfigUI>
 
