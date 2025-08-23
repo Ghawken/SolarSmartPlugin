@@ -1348,6 +1348,12 @@ class SolarSmartAsyncManager:
             if local_now >= reset_dt and st.get("day_reset_key") != today_str:
                 # Perform daily reset aligned to 06:00 exactly (not 'now')
                 reset_ts = reset_dt.timestamp()
+                # If we've already advanced the anchor to today's reset (or later), don't reset again on restart.
+                if (st.get("quota_anchor_ts") or 0) >= reset_ts:
+                    # Mark the daily reset as acknowledged for this runtime and continue with normal logic next ticks.
+                    st["day_reset_key"] = today_str
+                    return
+
                 st["day_reset_key"] = today_str
                 st["quota_anchor_ts"] = reset_ts
                 dev.updateStateOnServer("QuotaAnchorTs", f"{reset_ts:.3f}")
