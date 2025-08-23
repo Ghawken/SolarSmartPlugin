@@ -562,17 +562,17 @@ Tips:
   </Label>
 </Field>
 
-      <Field id="pvTestW" type="textfield" defaultValue="0">
+      <Field id="pvTestW" type="textfield" defaultValue="0" visibleBindingId="useGridHeadroom" visibleBindingValue="false">
         <Label>Test Solar Production (W):</Label>
         <Description>Integer Watts (e.g., 4200)</Description>
       </Field>
 
-      <Field id="consTestW" type="textfield" defaultValue="">
+      <Field id="consTestW" type="textfield" defaultValue="" visibleBindingId="useGridHeadroom" visibleBindingValue="false">
         <Label>Test Site Consumption (W):</Label>
         <Description>Integer Watts (optional, leave blank to omit)</Description>
       </Field>
 
-      <Field id="battTestW" type="textfield" defaultValue="">
+      <Field id="battTestW" type="textfield" defaultValue="" visibleBindingId="useGridHeadroom" visibleBindingValue="false">
         <Label>Test Battery Power (W):</Label>
         <Description>Positive = charging, Negative = discharging (optional)</Description>
       </Field>
