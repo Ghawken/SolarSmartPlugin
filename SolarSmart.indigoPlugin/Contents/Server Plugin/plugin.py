@@ -1423,14 +1423,15 @@ class SolarSmartAsyncManager:
             self.plugin.logger.exception(f"_maybe_rollover_quota: error on {dev.name}")
 
     # ========== Gather loads ==========
+    # REPLACE the entire _collect_loads_with_reasons with this version
     def _collect_loads_with_reasons(self) -> tuple[dict[int, list[indigo.Device]], dict[int, str]]:
         """
         Return:
           - dict of tier -> [all load devices], regardless of eligibility
           - dict of device.id -> skip_reason (string) for ineligible loads
 
-        Ineligible loads are included in tables with SKIP(reason), but won't be
-        considered for start decisions. We still enforce OFF for those cases.
+        Manual override:
+          - If active, reason='override' (we will NOT enforce OFF; we only SKIP).
         """
         tiers: dict[int, list[indigo.Device]] = {}
         skip_reasons: dict[int, str] = {}
@@ -1442,12 +1443,15 @@ class SolarSmartAsyncManager:
                 continue
 
             props = dev.pluginProps or {}
-            reason: str | None = None
-            # Catch-up override context
+
+            # Manual override gate (auto-hydrates from states and clears if expired)
+            ov_active, ov_until = self.plugin._override_status(dev)
+            reason: str | None = "override" if ov_active else None
+
+            # Catch-up window override (ignore DOW/time if deficit and in window)
             catchup_override = False
             try:
                 if bool(props.get("enableCatchup", False)):
-                    # Are we in catch-up window AND deficit remains?
                     cu_start = self._parse_hhmm(props.get("catchupWindowStart", "00:00"))
                     cu_end = self._parse_hhmm(props.get("catchupWindowEnd", "06:00"))
                     now_time = now.time()
@@ -1455,32 +1459,21 @@ class SolarSmartAsyncManager:
                         cu_target = int(props.get("catchupRuntimeMins") or 0)
                         served = self._served_quota_mins(dev)
                         if cu_target > served:
-                            catchup_override = True  # permit run even outside normal window/DOW
+                            catchup_override = True
             except Exception:
                 catchup_override = False
 
-            # Hydrate manual override persistence
-            try:
-                raw_until = dev.states.get("overrideUntilTs", "")
-                if raw_until:
-                    self._load_state.setdefault(dev.id, {})["override_until_ts"] = float(raw_until)
-                    # Ensure overrideActive matches current time
-                    active, _ = self._override_status(dev)
-                    if active and getattr(self, "debug2", False):
-                        self.logger.debug(f"Hydrated manual override active for {dev.name}")
-            except Exception:
-                pass
-            # Determine reason (first-match)
-            if not _dow_allowed(props, now) and not catchup_override:
-                reason = "window (DOW)"
-            elif not _time_window_allowed(props, now) and not catchup_override:
-                reason = "window (time)"
-            else:
-                remaining = self._quota_remaining_mins(dev, props, now)
-                if remaining <= 0:
-                    reason = "quota"
+            if reason != "override":  # only evaluate other reasons if not overridden
+                if not _dow_allowed(props, now) and not catchup_override:
+                    reason = "window (DOW)"
+                elif not _time_window_allowed(props, now) and not catchup_override:
+                    reason = "window (time)"
+                else:
+                    remaining = self._quota_remaining_mins(dev, props, now)
+                    if remaining <= 0:
+                        reason = "quota"
 
-            # Reflect enforcement for ineligible loads (but not for manual override)
+            # Enforcement: do NOT turn off for manual override, but do for others
             if reason and reason != "override" and self._is_running(dev):
                 self._ensure_off(dev, f"Not eligible: {reason}")
 
@@ -1489,7 +1482,7 @@ class SolarSmartAsyncManager:
             if reason:
                 skip_reasons[dev.id] = reason
 
-        # Fairness: sort each tier by least served quota minutes (keeps all loads)
+        # Fairness: sort each tier by least served quota minutes
         for t in tiers:
             tiers[t].sort(key=lambda d: self._served_quota_mins(d))
 
@@ -1659,6 +1652,27 @@ class SolarSmartAsyncManager:
             block.append(
                 f"    Window: {props.get('catchupWindowStart', '??')} - {props.get('catchupWindowEnd', '??')}   Enabled: {enabled_cu}")
 
+
+            # 🛑 Manual Override
+            try:
+                ov_active, ov_until_ts = self.plugin._override_status(dev)
+                if ov_until_ts:
+                    try:
+                        ov_until_str = datetime.fromtimestamp(float(ov_until_ts)).strftime("%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        ov_until_str = str(ov_until_ts)
+                else:
+                    ov_until_str = "—"
+            except Exception:
+                ov_active, ov_until_str = False, "—"
+
+            block.append("🛑 Manual Override")
+            block.append(f"    Active: {ov_active}   Until: {ov_until_str}")
+            try:
+                block.append(f"    Device states: overrideActive={dev.states.get('overrideActive')} until='{dev.states.get('overrideUntil')}'")
+            except Exception:
+                pass
+
             block.append("🔌 External / Control")
             if inverted:
                 block.append(
@@ -1809,8 +1823,8 @@ class SolarSmartAsyncManager:
                 # 1) If there is a skip reason, show row and do not attempt start
                 skip_reason = skip_reasons.get(d.id)
                 if skip_reason:
-                    if self._is_running(d):
-                        # Device became (or stayed) ON after mirroring; enforce policy again.
+                    if self._is_running(d) and skip_reason != "override":
+                        # Only enforce OFF for non-override reasons
                         self._ensure_off(d, f"Not eligible: {skip_reason}")
                     status = "RUN" if self._is_running(d) else "OFF"
                     action = f"SKIP ({skip_reason})"
@@ -1830,7 +1844,6 @@ class SolarSmartAsyncManager:
                         starts_this_tick=starts_this_tick,
                         running_now=running_now
                     )
-                    # Do not modify headroom or attempt start
                     continue
 
                 if self._is_running(d):
@@ -2078,22 +2091,13 @@ class SolarSmartAsyncManager:
 
 
     # ---------- Shedding (one at a time) ----------
+    # REPLACE the entire _shed_until_positive with this corrected version
     def _shed_until_positive(self, headroom_w: int, running_by_tier: list[tuple[int, indigo.Device]]) -> int:
         """
-        Shed exactly ONE running device to improve (ideally fix) negative headroom.
-        Strategy:
-          1) If headroom >= 0 -> no-op.
-          2) Among running loads, prefer lowest-priority (highest tier).
-          3) Try to pick the smallest rated load that covers the deficit.
-          4) If none can cover the deficit alone, shed the smallest load in the lowest priority.
-        Returns the new headroom after shedding that one device.
+        Shed exactly ONE running device to improve negative headroom.
+        Skips devices under Manual Override and those in catch-up active mode.
         """
         dbg = getattr(self.plugin, "debug2", False)
-
-        # Honor manual override: never stop due to headroom/quota while override is active
-        ov_active, _ = self.plugin._override_status(dev)
-        if ov_active:
-            return None
 
         if headroom_w >= 0 or not running_by_tier:
             if dbg:
@@ -2104,7 +2108,6 @@ class SolarSmartAsyncManager:
         if dbg:
             self.plugin.logger.debug(f"_shed_until_positive: starting headroom={headroom_w}W (deficit={deficit}W)")
 
-        # Build candidate list: (tier, dev, rated)
         candidates = []
         for tier, dev in running_by_tier:
             try:
@@ -2113,12 +2116,21 @@ class SolarSmartAsyncManager:
                 rated = 0
             if not self._is_running(dev) or rated <= 0:
                 continue
-            # Skip if catch-up active to avoid undoing fallback start
+
+            # Skip devices in catch-up mode (we started them for fallback)
             st = self.plugin._load_state.get(dev.id, {})
             if st.get("catchup_active"):
-                if getattr(self.plugin, "debug2", False):
-                    self.plugin.logger.debug(f"_shed_until_positive: skip shedding (catch-up active) {dev.name}")
+                if dbg:
+                    self.plugin.logger.debug(f"_shed_until_positive: skip (catch-up active) {dev.name}")
                 continue
+
+            # Skip devices under Manual Override
+            ov_active, _ = self.plugin._override_status(dev)
+            if ov_active:
+                if dbg:
+                    self.plugin.logger.debug(f"_shed_until_positive: skip (manual override) {dev.name}")
+                continue
+
             candidates.append((tier, dev, rated))
 
         if not candidates:
@@ -2126,20 +2138,16 @@ class SolarSmartAsyncManager:
                 self.plugin.logger.debug("_shed_until_positive: no valid running candidates to shed")
             return headroom_w
 
-        # Prefer lowest priority (highest tier). Within that, pick the smallest rated that fixes the deficit.
-        # Split into two sets for clarity: those that can fix, those that can't.
-        candidates.sort(key=lambda tdr: (tdr[0], tdr[2]))  # tier asc first; we’ll reverse for lowest priority
-        # Lowest priority tier value:
+        # Prefer lowest priority (highest tier), pick smallest that fixes deficit, else smallest in that tier
+        candidates.sort(key=lambda tdr: (tdr[0], tdr[2]))
         max_tier = max(t for t, _, _ in candidates)
-
         in_lowest_priority = [x for x in candidates if x[0] == max_tier]
         can_fix = [x for x in in_lowest_priority if x[2] >= deficit]
+
         if can_fix:
-            # pick the smallest that fixes
             tier, dev, rated = sorted(can_fix, key=lambda tdr: tdr[2])[0]
             choice_reason = f"lowest-priority tier {tier}, minimal rated covering deficit"
         else:
-            # None in lowest priority can fix; shed smallest in lowest priority to be gentle
             tier, dev, rated = sorted(in_lowest_priority, key=lambda tdr: tdr[2])[0]
             choice_reason = f"lowest-priority tier {tier}, smallest rated (partial improvement)"
 
