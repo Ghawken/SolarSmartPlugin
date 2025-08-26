@@ -1458,6 +1458,18 @@ class SolarSmartAsyncManager:
                             catchup_override = True  # permit run even outside normal window/DOW
             except Exception:
                 catchup_override = False
+
+            # Hydrate manual override persistence
+            try:
+                raw_until = dev.states.get("overrideUntilTs", "")
+                if raw_until:
+                    self._load_state.setdefault(dev.id, {})["override_until_ts"] = float(raw_until)
+                    # Ensure overrideActive matches current time
+                    active, _ = self._override_status(dev)
+                    if active and getattr(self, "debug2", False):
+                        self.logger.debug(f"Hydrated manual override active for {dev.name}")
+            except Exception:
+                pass
             # Determine reason (first-match)
             if not _dow_allowed(props, now) and not catchup_override:
                 reason = "window (DOW)"
@@ -1468,8 +1480,8 @@ class SolarSmartAsyncManager:
                 if remaining <= 0:
                     reason = "quota"
 
-            # Reflect enforcement for ineligible loads
-            if reason and self._is_running(dev):
+            # Reflect enforcement for ineligible loads (but not for manual override)
+            if reason and reason != "override" and self._is_running(dev):
                 self._ensure_off(dev, f"Not eligible: {reason}")
 
             tier = int(props.get("tier", 2))
@@ -1493,6 +1505,11 @@ class SolarSmartAsyncManager:
           • Headroom can’t sustain rated power (with small hysteresis)
         """
         # Quota
+        # Honor manual override: never stop due to headroom/quota while override is active
+        ov_active, _ = self.plugin._override_status(dev)
+        if ov_active:
+            return None
+
         try:
             remaining = int(self._quota_remaining_mins(dev, props, datetime.now()))
         except Exception:
@@ -2072,6 +2089,12 @@ class SolarSmartAsyncManager:
         Returns the new headroom after shedding that one device.
         """
         dbg = getattr(self.plugin, "debug2", False)
+
+        # Honor manual override: never stop due to headroom/quota while override is active
+        ov_active, _ = self.plugin._override_status(dev)
+        if ov_active:
+            return None
+
         if headroom_w >= 0 or not running_by_tier:
             if dbg:
                 self.plugin.logger.debug(f"_shed_until_positive: headroom ok ({headroom_w}W) or no running loads")
@@ -3045,6 +3068,18 @@ class Plugin(indigo.PluginBase):
                 if not dev.states.get("LastReason"):
                     dev.updateStateOnServer("LastReason", "Plugin restart recovery")
 
+            # Hydrate manual override persistence
+            try:
+                raw_until = dev.states.get("overrideUntilTs", "")
+                if raw_until:
+                    self._load_state.setdefault(dev.id, {})["override_until_ts"] = float(raw_until)
+                    # Ensure overrideActive matches current time
+                    active, _ = self._override_status(dev)
+                    if active and getattr(self, "debug2", False):
+                        self.logger.debug(f"Hydrated manual override active for {dev.name}")
+            except Exception:
+                pass
+
             # Catch-up run secs rehydrate
             try:
                 cur_cu_run = int(dev.states.get("catchupRunTodayMins", 0) or 0)
@@ -3170,6 +3205,117 @@ class Plugin(indigo.PluginBase):
             return time.time() >= float(next_ts)
         except Exception:
             return True
+
+## ACtion group helpers
+    def load_device_list(self, filter="", valuesDict=None, typeId="", targetId=0):
+        """Menu of enabled SolarSmart Load devices for Actions."""
+        items = []
+        try:
+            for d in indigo.devices.iter("self"):
+                if d.deviceTypeId == "solarsmartLoad" and d.enabled:
+                    items.append((str(d.id), f"{d.name} (#{d.id})"))
+        except Exception:
+            pass
+        if not items:
+            items = [("-1", "— No SolarSmart Loads —")]
+        items.sort(key=lambda t: t[1].lower())
+        return items
+
+    def _override_status(self, dev) -> tuple[bool, float | None]:
+        """
+        Return (active, until_ts). Auto-expires and clears if past.
+        Syncs from device states on first use (persists across restart).
+        """
+        st = self._load_state.setdefault(dev.id, {})
+        now = time.time()
+
+        # Hydrate from device states if missing in memory
+        if "override_until_ts" not in st:
+            try:
+                raw = dev.states.get("overrideUntilTs")
+                if raw:
+                    st["override_until_ts"] = float(raw)
+            except Exception:
+                st["override_until_ts"] = None
+
+        until = st.get("override_until_ts")
+        if until and now < float(until):
+            return True, float(until)
+
+        # Expired or not set -> clear device states if needed
+        if dev.states.get("overrideActive", False):
+            try:
+                dev.updateStateOnServer("overrideActive", False)
+                dev.updateStateOnServer("overrideUntil", "")
+                dev.updateStateOnServer("overrideUntilTs", "")
+            except Exception:
+                pass
+        st["override_until_ts"] = None
+        return False, None
+
+    def _set_manual_override(self, dev, hours: int):
+        hours = max(1, int(hours))
+        until_ts = time.time() + (hours * 3600)
+        self._load_state.setdefault(dev.id, {})["override_until_ts"] = until_ts
+
+        # Human local time
+        try:
+            until_str = datetime.fromtimestamp(until_ts).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            until_str = str(int(until_ts))
+
+        try:
+            dev.updateStateOnServer("overrideActive", True)
+            dev.updateStateOnServer("overrideUntil", until_str)
+            dev.updateStateOnServer("overrideUntilTs", f"{until_ts:.3f}")
+            dev.updateStateOnServer("LastReason", f"Manual override until {until_str}")
+        except Exception:
+            pass
+        self.logger.info(f"Manual override enabled for '{dev.name}' until {until_str}. Scheduler will not start/stop this load.")
+
+    def _clear_manual_override(self, dev):
+        st = self._load_state.setdefault(dev.id, {})
+        st["override_until_ts"] = None
+        try:
+            dev.updateStateOnServer("overrideActive", False)
+            dev.updateStateOnServer("overrideUntil", "")
+            dev.updateStateOnServer("overrideUntilTs", "")
+            dev.updateStateOnServer("LastReason", "Manual override cleared")
+        except Exception:
+            pass
+        self.logger.info(f"Manual override cleared for '{dev.name}'. Scheduler control resumed.")
+
+    def set_manual_override_action(self, pluginAction):
+        try:
+            dev_id = int(pluginAction.props.get("targetLoadId", 0) or 0)
+            hours = int(pluginAction.props.get("durationHours", 6) or 6)
+        except Exception:
+            dev_id, hours = 0, 6
+        if dev_id <= 0 or dev_id not in indigo.devices:
+            self.logger.error("Set Manual Override: select a valid SolarSmart Load.")
+            return
+        dev = indigo.devices[dev_id]
+        if dev.deviceTypeId != "solarsmartLoad":
+            self.logger.error("Set Manual Override: target must be a SolarSmart Load device.")
+            return
+        self._set_manual_override(dev, hours)
+
+    def clear_manual_override_action(self, pluginAction):
+        try:
+            dev_id = int(pluginAction.props.get("targetLoadId", 0) or 0)
+        except Exception:
+            dev_id = 0
+        if dev_id <= 0 or dev_id not in indigo.devices:
+            self.logger.error("Clear Manual Override: select a valid SolarSmart Load.")
+            return
+        dev = indigo.devices[dev_id]
+        if dev.deviceTypeId != "solarsmartLoad":
+            self.logger.error("Clear Manual Override: target must be a SolarSmart Load device.")
+            return
+        self._clear_manual_override(dev)
+
+        ## Action Group
+
 
     def _schedule_next_forecast_refresh(self):
         """Schedule the next allowed refresh window based on updates per day."""

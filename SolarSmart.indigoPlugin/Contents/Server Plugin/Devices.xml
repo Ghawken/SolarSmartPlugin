@@ -450,7 +450,22 @@ If this amount is already met in Runtime above, no CatchUp will occur.</Label>
       <TriggerLabel>Rated power changed</TriggerLabel>
       <ControlPageLabel>Rated W</ControlPageLabel>
     </State>
-
+<!-- Add under <Device id="solarsmartLoad"> ... <States> -->
+<State id="overrideActive">
+  <ValueType>Boolean</ValueType>
+  <TriggerLabel>Manual override active changed</TriggerLabel>
+  <ControlPageLabel>Manual Override Active</ControlPageLabel>
+</State>
+<State id="overrideUntil">
+  <ValueType>String</ValueType>
+  <TriggerLabel>Manual override until (local) changed</TriggerLabel>
+  <ControlPageLabel>Manual Override Until</ControlPageLabel>
+</State>
+<State id="overrideUntilTs">
+  <ValueType>String</ValueType>
+  <TriggerLabel>Manual override until (epoch) changed</TriggerLabel>
+  <ControlPageLabel>Manual Override Until (epoch)</ControlPageLabel>
+</State>
     <State id="StartedAt">
       <ValueType>String</ValueType>
       <TriggerLabel>Start time changed</TriggerLabel>

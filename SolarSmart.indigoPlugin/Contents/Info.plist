@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>PluginVersion</key>
-	<string>1.0.40</string>
+	<string>1.0.50</string>
 	<key>ServerApiVersion</key>
 	<string>3.0.0</string>
 	<key>IwsApiVersion</key>
@@ -11,7 +11,7 @@
 	<key>CFBundleDisplayName</key>
 	<string>SolarSmart</string>
 	<key>CFBundleName</key>
-	<string>Blank</string>
+	<string>SolarSmart Plugin</string>
         <key>CFBundleIdentifier</key>
 	<string>com.GlennNZ.indigoplugin.SolarSmart</string>
 	<key>CFBundleVersion</key>

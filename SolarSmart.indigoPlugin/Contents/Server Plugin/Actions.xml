@@ -1,7 +1,39 @@
-<?xml version="1.0"?>
 <Actions>
+  <Action id="setManualOverride">
+    <Name>Set Manual Override (suspend control)</Name>
+    <Description>Temporarily suspend SolarSmart control for a selected load. You can manually operate the device during this time.</Description>
+    <CallbackMethod>set_manual_override_action</CallbackMethod>
+    <ConfigUI>
+      <Field id="targetLoadId" type="menu">
+        <Label>SolarSmart Load:</Label>
+        <List class="self" method="load_device_list" dynamicReload="true"/>
+      </Field>
+      <Field id="durationHours" type="menu" defaultValue="6">
+        <Label>Duration (hours):</Label>
+        <List>
+          <Option value="1">1 hour</Option>
+          <Option value="2">2 hours</Option>
+          <Option value="3">3 hours</Option>
+          <Option value="4">4 hours</Option>
+          <Option value="6">6 hours</Option>
+          <Option value="12">12 hours</Option>
+        </List>
+      </Field>
+      <Field id="hint" type="label" fontColor="blue" fontSize="small">
+        <Label>While active, the scheduler will not start/stop this load. Control it manually in Indigo if needed.</Label>
+      </Field>
+    </ConfigUI>
+  </Action>
 
-
-  
+  <Action id="clearManualOverride">
+    <Name>Clear Manual Override (resume control)</Name>
+    <Description>Resume SolarSmart control for a selected load immediately.</Description>
+    <CallbackMethod>clear_manual_override_action</CallbackMethod>
+    <ConfigUI>
+      <Field id="targetLoadId" type="menu">
+        <Label>SolarSmart Load:</Label>
+        <List class="self" method="load_device_list" dynamicReload="true"/>
+      </Field>
+    </ConfigUI>
+  </Action>
 </Actions>
-
