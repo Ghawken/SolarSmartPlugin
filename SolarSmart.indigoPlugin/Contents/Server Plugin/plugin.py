@@ -1296,15 +1296,9 @@ class SolarSmartAsyncManager:
         return None
 
     def _quota_window_minutes(self, props) -> int:
-        """Map the device's window selection to minutes. Defaults to 24h."""
-        # Expect props like: quotaWindow = "12h"|"24h"|"48h"|"72h"
-        key = (props.get("quotaWindow") or "24h").lower()
-        return {
-            "12h": 12 * 60,
-            "24h": 24 * 60,
-            "48h": 48 * 60,
-            "72h": 72 * 60,
-        }.get(key, 24 * 60)
+        """Map device's quotaWindow to minutes using the single source of truth."""
+        period = (props.get("quotaWindow") or "24h").lower()
+        return self._quota_horizon_minutes(period)
 
         # Add near other small helpers
     def _get_quota_window_days(self, props) -> int:
@@ -1996,8 +1990,12 @@ class SolarSmartAsyncManager:
                 f"{'─' * w_action}"
             )
 
+            override_count = sum(1 for r in skip_reasons.values() if r == "override")
+
             banner_top = "🌞📈  SolarSmart Scheduler  📊🔌"
             banner_bottom = f"🌤️  Final headroom: {headroom_w} W"
+            if override_count:
+                banner_bottom += f"   |   🛑 Manual override active: {override_count}"
 
             rows_str = "\n".join(
                 row_line(tier, name, rated, status, run_min, rem, need, cu, action)
@@ -4373,11 +4371,11 @@ class Plugin(indigo.PluginBase):
 
         # Normalize strings
         if isinstance(raw, str):
-            watts = _parse_to_watts(raw)
+            watts = self._parse_to_watts(raw)
             return watts
 
         # Fallback: try str() then parse
-        return _parse_to_watts(str(raw))
+        return self._parse_to_watts(str(raw))
 
     # ────────────────────────────────────────────────────────────
     # Parsing helpers (pure functions)
