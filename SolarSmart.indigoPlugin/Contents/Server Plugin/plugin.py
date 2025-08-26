@@ -321,11 +321,6 @@ class SolarSmartAsyncManager:
         self._tasks.clear()
 
     # ----- forever loops -----
-    def _get_main_device(self):
-        return next(
-            (d for d in indigo.devices if d.deviceTypeId == "solarsmartMain" and d.enabled),
-            None
-        )
 
     def _parse_hhmm(self, s: str) -> dtime:
         s = (s or "").strip()
@@ -536,22 +531,6 @@ class SolarSmartAsyncManager:
 
         if getattr(self.plugin, "debug2", False):
             self.plugin.logger.debug("_ticker_main_states: exiting (stopThread set)")
-
-
-    def _parse_hhmm(self, s: str) -> dtime:
-        s = (s or "").strip()
-        try:
-            hh, mm = s.split(":")
-            return dtime(hour=int(hh), minute=int(mm))
-        except Exception:
-            return dtime(0, 0)
-
-    def _time_in_window(self, now_t: dtime, start_t: dtime, end_t: dtime) -> bool:
-        # Handles normal (start<end) and overnight (start>end) windows
-        if start_t < end_t:
-            return start_t <= now_t < end_t
-        else:
-            return (now_t >= start_t) or (now_t < end_t)
 
 
 
@@ -884,15 +863,16 @@ class SolarSmartAsyncManager:
 
         while not getattr(self.plugin, "stopThread", False):
             # Ensure a Main device exists; if not, shed, pause, and retry
-            main = self._get_main_device()
-            if not main:
-                if getattr(self.plugin, "debug2", False):
-                    self.plugin.logger.debug("_ticker_load_scheduler: no Main device found; pausing and retrying")
-                self._shed_all("No Main device available")
-                await asyncio.sleep(period_sec)
-                continue
 
             try:
+                main = self._get_main_device()
+                if not main:
+                    if getattr(self.plugin, "debug2", False):
+                        self.plugin.logger.debug("_ticker_load_scheduler: no Main device found; pausing and retrying")
+                    self._shed_all("No Main device available")
+                    await asyncio.sleep(period_sec)
+                    continue
+
                 # 1) Get best-available headroom from any enabled SolarSmart Main device
                 headroom_w = self._get_current_headroom_w()
                 if headroom_w is None:
