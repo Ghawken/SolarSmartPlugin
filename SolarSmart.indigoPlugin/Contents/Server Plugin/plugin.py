@@ -39,7 +39,7 @@ from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 import re
 # Add near the top with other imports
-from forecast_solar_service import ForecastSolarClient, PVPlane
+from forecast_solar_service import ForecastSolarClient, PVPlane, ForecastSolarRateLimitError
 
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -880,15 +880,18 @@ class SolarSmartAsyncManager:
         # keyed by load dev id: {"running": bool, "start_ts": float, "served_quota_mins": int, ...}
         if not hasattr(self.plugin, "_load_state"):
             self.plugin._load_state = {}
-        # early in _ticker_load_scheduler
-        main = next((d for d in indigo.devices if d.deviceTypeId == "solarsmartMain" and d.enabled), None)
-        if not main:
-            if getattr(self.plugin, "debug2", False):
-                self.plugin.logger.debug("_ticker_load_scheduler: no Main device found; shedding any running loads")
-            self._shed_all("No Main device available")
-            return
+
 
         while not getattr(self.plugin, "stopThread", False):
+            # Ensure a Main device exists; if not, shed, pause, and retry
+            main = self._get_main_device()
+            if not main:
+                if getattr(self.plugin, "debug2", False):
+                    self.plugin.logger.debug("_ticker_load_scheduler: no Main device found; pausing and retrying")
+                self._shed_all("No Main device available")
+                await asyncio.sleep(period_sec)
+                continue
+
             try:
                 # 1) Get best-available headroom from any enabled SolarSmart Main device
                 headroom_w = self._get_current_headroom_w()
@@ -1510,7 +1513,6 @@ class SolarSmartAsyncManager:
             return None
 
         # Headroom sustain check
-        ...
 
         # Headroom sustain check (simple + tiny hysteresis)
         try:
