@@ -657,15 +657,23 @@ class SolarSmartAsyncManager:
                     if st.get("catchup_active") and not self._is_running(d):
                         st["catchup_active"] = False
                         d.updateStateOnServer("catchupActive", False)
+
                     # Config target
+                    # Config target (effective: capped by preferred window max if set)
                     try:
-                        catchup_runtime = int(props.get("catchupRuntimeMins") or 0)
+                        cu_raw = int(props.get("catchupRuntimeMins") or 0)
                     except Exception:
-                        catchup_runtime = 0
+                        cu_raw = 0
+                    try:
+                        max_pref = int(props.get("maxRuntimePerQuotaMins") or 0)
+                    except Exception:
+                        max_pref = 0
+                    catchup_target_eff = min(cu_raw, max_pref) if max_pref > 0 else cu_raw
 
-                    d.updateStateOnServer("catchupDailyTargetMins", catchup_runtime)
+                    # Publish effective target to the device state (controls pages/table read this)
+                    d.updateStateOnServer("catchupDailyTargetMins", catchup_target_eff)
 
-                    if catchup_runtime <= 0:
+                    if catchup_target_eff <= 0:
                         # Target is zero; publish zeros & clear flag
                         if st.get("catchup_active"):
                             st["catchup_active"] = False
@@ -678,8 +686,9 @@ class SolarSmartAsyncManager:
                             self.plugin.logger.debug(f"[CATCHUP] {d.name}: target=0 → nothing required")
                         continue
 
+                    # Compute remaining catch-up against Served (RuntimeQuotaMins), not catch-up-only minutes
                     served = self._served_quota_mins(d)
-                    remaining_fallback = max(0, catchup_runtime - served)
+                    remaining_fallback = max(0, catchup_target_eff - served)
 
                     start_t = self._parse_hhmm(props.get("catchupWindowStart", "00:00"))
                     end_t = self._parse_hhmm(props.get("catchupWindowEnd", "06:00"))
@@ -1433,9 +1442,13 @@ class SolarSmartAsyncManager:
                     cu_end = self._parse_hhmm(props.get("catchupWindowEnd", "06:00"))
                     now_time = now.time()
                     if self._time_in_window(now_time, cu_start, cu_end):
-                        cu_target = int(props.get("catchupRuntimeMins") or 0)
+                        # Effective catch-up target: cap by preferred window max if set
+                        cu_raw = int(props.get("catchupRuntimeMins") or 0)
+                        max_pref = int(props.get("maxRuntimePerQuotaMins") or 0)
+                        cu_eff = min(cu_raw, max_pref) if max_pref > 0 else cu_raw
+
                         served = self._served_quota_mins(dev)
-                        if cu_target > served:
+                        if cu_eff > served:
                             catchup_override = True
             except Exception:
                 catchup_override = False
