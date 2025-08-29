@@ -684,6 +684,22 @@ class SolarSmartAsyncManager:
                     served = self._served_quota_mins(d)
                     remaining_fallback = max(0, catchup_target - served)
 
+                    # Honor Manual Override: do not start/stop under override
+                    ov_active, _ = self.plugin._override_status(d)
+                    if ov_active:
+                        # Publish remaining for visibility; stop managing catch-up
+                        run_cu_mins = int(float(st.get("catchup_run_secs", 0.0)) // 60)
+                        d.updateStateOnServer("catchupRemainingTodayMins", remaining_fallback)
+                        d.updateStateOnServer("catchupRunTodayMins", run_cu_mins)
+                        d.updateStateOnServer("catchupRunWindowAccumMins", run_cu_mins)
+                        if st.get("catchup_active"):
+                            st["catchup_active"] = False
+                            d.updateStateOnServer("catchupActive", False)
+                        if getattr(self.plugin, "debug6", False):  # your current catch-up debug gate
+                            self.plugin.logger.debug(
+                                f"[CATCHUP][SKIP-OVERRIDE] {d.name}: override active; remaining={remaining_fallback}m")
+                        continue
+
                     start_t = self._parse_hhmm(props.get("catchupWindowStart", "00:00"))
                     end_t = self._parse_hhmm(props.get("catchupWindowEnd", "06:00"))
                     in_window = self._time_in_window(now_t, start_t, end_t)
