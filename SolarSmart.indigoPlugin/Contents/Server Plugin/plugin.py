@@ -273,6 +273,7 @@ class SolarSmartAsyncManager:
         self.plugin = plugin
         self.loop = event_loop
         self._tasks = []
+        self._ANCHOR_HOUR = 6  # 06:00 local
         # Log instantiation so it shows up in Indigo logs
         try:
             self.plugin.logger.info("SolarSmart AsyncManager initialised — async loop manager ready.")
@@ -282,80 +283,7 @@ class SolarSmartAsyncManager:
             indigo.server.log(f"SolarSmartAsyncManager initialised (logger not ready: {e})", isError=True)
         # Inside class SolarSmartAsyncManager (near other small helpers)
 
-        _ANCHOR_HOUR = 6  # 06:00 local
 
-        def _aligned_window_key(self, props: dict) -> str:
-            """Normalize the configured quota window to a canonical key."""
-            period = (props.get("quotaWindow") or "24h").lower()
-            if period == "1d":
-                period = "24h"
-            return period if period in {"12h", "24h", "2d", "3d"} else "24h"
-
-        def _aligned_last_next_slot(self, props: dict, now: datetime | None = None) -> tuple[datetime, datetime, str]:
-            """
-            Return (last_reset_dt_local, next_reset_dt_local, slot_key) for the configured window.
-
-            Rules (LOCAL time):
-              - 12h: slots start at 06:00 and 18:00 every day.
-              - 24h: slots start at 06:00 every day.
-              - 2d/3d: slots start at 06:00 every N days, anchored to a fixed base date.
-            """
-            now = now or datetime.now()
-            key = self._aligned_window_key(props)
-            h6 = datetime(now.year, now.month, now.day, self._ANCHOR_HOUR, 0, 0)
-
-            if key == "12h":
-                # Two slots per day at 06:00 and 18:00
-                slot1 = h6
-                slot2 = h6.replace(hour=18)
-                if now >= slot2:
-                    last_dt = slot2
-                    next_dt = slot1.replace(day=slot1.day + 1)  # tomorrow 06:00
-                elif now >= slot1:
-                    last_dt = slot1
-                    next_dt = slot2
-                else:
-                    # before 06:00 -> last is yesterday 18:00, next is today 06:00
-                    y = h6 - datetime.timedelta(days=1)
-                    last_dt = y.replace(hour=18)
-                    next_dt = h6
-                slot_key = f"12h:{last_dt.strftime('%Y%m%d%H')}"
-                return last_dt, next_dt, slot_key
-
-            if key == "24h":
-                # Daily 06:00
-                if now >= h6:
-                    last_dt = h6
-                    next_dt = h6 + datetime.timedelta(days=1)
-                else:
-                    y = h6 - datetime.timedelta(days=1)
-                    last_dt = y
-                    next_dt = h6
-                slot_key = f"24h:{last_dt.strftime('%Y%m%d%H')}"
-                return last_dt, next_dt, slot_key
-
-            # Multi-day (2d/3d) at 06:00 aligned to a base date
-            stride_days = 2 if key == "2d" else 3
-            # Choose a fixed base date in local calendar (stable anchor)
-            base_date = datetime(2025, 1, 1, self._ANCHOR_HOUR, 0, 0)
-            # Work in dates to avoid DST drift
-            today = now.date()
-            base = base_date.date()
-            days_since = (today - base).days
-            bucket = (days_since // stride_days) * stride_days
-            candidate_date = base + datetime.timedelta(days=bucket)
-            candidate_dt = datetime(candidate_date.year, candidate_date.month, candidate_date.day, self._ANCHOR_HOUR, 0,
-                                    0)
-            if now >= candidate_dt:
-                last_dt = candidate_dt
-            else:
-                prev_date = candidate_date - datetime.timedelta(days=stride_days)
-                last_dt = datetime(prev_date.year, prev_date.month, prev_date.day, self._ANCHOR_HOUR, 0, 0)
-            next_date = last_dt.date() + datetime.timedelta(days=stride_days)
-            next_dt = datetime(next_date.year, next_date.month, next_date.day, self._ANCHOR_HOUR, 0, 0)
-
-            slot_key = f"{key}:{last_dt.strftime('%Y%m%d%H')}"
-            return last_dt, next_dt, slot_key
     # ----- lifecycle -----
     def _track_task(self, coro, name: str):
         async def _runner():
@@ -371,6 +299,61 @@ class SolarSmartAsyncManager:
         self._tasks.append(task)
         return task
 
+    def _aligned_window_key(self, props: dict) -> str:
+        """Normalize the configured quota window to a canonical key."""
+        period = (props.get("quotaWindow") or "24h").lower()
+        if period == "1d":
+            period = "24h"
+        return period if period in {"12h", "24h", "2d", "3d"} else "24h"
+
+    def _aligned_last_next_slot(self, props: dict, now: datetime | None = None) -> tuple[datetime, datetime, str]:
+        now = now or datetime.now()
+        key = self._aligned_window_key(props)
+        h6 = datetime(now.year, now.month, now.day, self._ANCHOR_HOUR, 0, 0)
+
+        if key == "12h":
+            slot1 = h6
+            slot2 = h6.replace(hour=18)
+            if now >= slot2:
+                last_dt = slot2
+                next_dt = slot1 + dt.timedelta(days=1)  # tomorrow 06:00
+            elif now >= slot1:
+                last_dt = slot1
+                next_dt = slot2
+            else:
+                y = h6 - dt.timedelta(days=1)
+                last_dt = y.replace(hour=18)
+                next_dt = h6
+            slot_key = f"12h:{last_dt.strftime('%Y%m%d%H')}"
+            return last_dt, next_dt, slot_key
+
+        if key == "24h":
+            if now >= h6:
+                last_dt = h6
+                next_dt = h6 + dt.timedelta(days=1)
+            else:
+                last_dt = h6 - dt.timedelta(days=1)
+                next_dt = h6
+            slot_key = f"24h:{last_dt.strftime('%Y%m%d%H')}"
+            return last_dt, next_dt, slot_key
+
+        stride_days = 2 if key == "2d" else 3
+        base_date = datetime(2025, 1, 1, self._ANCHOR_HOUR, 0, 0)
+        today = now.date()
+        base = base_date.date()
+        days_since = (today - base).days
+        bucket = (days_since // stride_days) * stride_days
+        candidate_date = base + dt.timedelta(days=bucket)
+        candidate_dt = datetime(candidate_date.year, candidate_date.month, candidate_date.day, self._ANCHOR_HOUR, 0, 0)
+        if now >= candidate_dt:
+            last_dt = candidate_dt
+        else:
+            prev_date = candidate_date - dt.timedelta(days=stride_days)
+            last_dt = datetime(prev_date.year, prev_date.month, prev_date.day, self._ANCHOR_HOUR, 0, 0)
+        next_date = last_dt.date() + dt.timedelta(days=stride_days)
+        next_dt = datetime(next_date.year, next_date.month, next_date.day, self._ANCHOR_HOUR, 0, 0)
+        slot_key = f"{key}:{last_dt.strftime('%Y%m%d%H')}"
+        return last_dt, next_dt, slot_key
 
     async def start(self):
         """Schedule forever loops. Call once from _async_start()."""
@@ -4128,7 +4111,7 @@ class Plugin(indigo.PluginBase):
 
         except Exception as error:
             self.errorLog(u"Error refreshing devices. Please check settings.")
-            self.errorLog(unicode(error.message))
+            self.errorLog(str(error))
             return False
 
     def refreshDataForDev(self, dev):
@@ -4160,19 +4143,6 @@ class Plugin(indigo.PluginBase):
         self.refreshDataForDev(dev)
         return True
 
-    def stopSleep(self, start_sleep):
-        """
-        The stopSleep() method accounts for changes to the user upload interval
-        preference. The plugin checks every 2 seconds to see if the sleep
-        interval should be updated.
-        """
-        try:
-            total_sleep = float(self.pluginPrefs.get('configMenuUploadInterval', 300))
-        except:
-            total_sleep = iTimer  # TODO: Note variable iTimer is an unresolved reference.
-        if t.time() - start_sleep > total_sleep:
-            return True
-        return False
 
     def toggleDebugEnabled(self):
         """
