@@ -280,7 +280,82 @@ class SolarSmartAsyncManager:
             # Fallback to Indigo's logger if plugin.logger isn't ready yet
             import indigo
             indigo.server.log(f"SolarSmartAsyncManager initialised (logger not ready: {e})", isError=True)
+        # Inside class SolarSmartAsyncManager (near other small helpers)
 
+        _ANCHOR_HOUR = 6  # 06:00 local
+
+        def _aligned_window_key(self, props: dict) -> str:
+            """Normalize the configured quota window to a canonical key."""
+            period = (props.get("quotaWindow") or "24h").lower()
+            if period == "1d":
+                period = "24h"
+            return period if period in {"12h", "24h", "2d", "3d"} else "24h"
+
+        def _aligned_last_next_slot(self, props: dict, now: datetime | None = None) -> tuple[datetime, datetime, str]:
+            """
+            Return (last_reset_dt_local, next_reset_dt_local, slot_key) for the configured window.
+
+            Rules (LOCAL time):
+              - 12h: slots start at 06:00 and 18:00 every day.
+              - 24h: slots start at 06:00 every day.
+              - 2d/3d: slots start at 06:00 every N days, anchored to a fixed base date.
+            """
+            now = now or datetime.now()
+            key = self._aligned_window_key(props)
+            h6 = datetime(now.year, now.month, now.day, self._ANCHOR_HOUR, 0, 0)
+
+            if key == "12h":
+                # Two slots per day at 06:00 and 18:00
+                slot1 = h6
+                slot2 = h6.replace(hour=18)
+                if now >= slot2:
+                    last_dt = slot2
+                    next_dt = slot1.replace(day=slot1.day + 1)  # tomorrow 06:00
+                elif now >= slot1:
+                    last_dt = slot1
+                    next_dt = slot2
+                else:
+                    # before 06:00 -> last is yesterday 18:00, next is today 06:00
+                    y = h6 - datetime.timedelta(days=1)
+                    last_dt = y.replace(hour=18)
+                    next_dt = h6
+                slot_key = f"12h:{last_dt.strftime('%Y%m%d%H')}"
+                return last_dt, next_dt, slot_key
+
+            if key == "24h":
+                # Daily 06:00
+                if now >= h6:
+                    last_dt = h6
+                    next_dt = h6 + datetime.timedelta(days=1)
+                else:
+                    y = h6 - datetime.timedelta(days=1)
+                    last_dt = y
+                    next_dt = h6
+                slot_key = f"24h:{last_dt.strftime('%Y%m%d%H')}"
+                return last_dt, next_dt, slot_key
+
+            # Multi-day (2d/3d) at 06:00 aligned to a base date
+            stride_days = 2 if key == "2d" else 3
+            # Choose a fixed base date in local calendar (stable anchor)
+            base_date = datetime(2025, 1, 1, self._ANCHOR_HOUR, 0, 0)
+            # Work in dates to avoid DST drift
+            today = now.date()
+            base = base_date.date()
+            days_since = (today - base).days
+            bucket = (days_since // stride_days) * stride_days
+            candidate_date = base + datetime.timedelta(days=bucket)
+            candidate_dt = datetime(candidate_date.year, candidate_date.month, candidate_date.day, self._ANCHOR_HOUR, 0,
+                                    0)
+            if now >= candidate_dt:
+                last_dt = candidate_dt
+            else:
+                prev_date = candidate_date - datetime.timedelta(days=stride_days)
+                last_dt = datetime(prev_date.year, prev_date.month, prev_date.day, self._ANCHOR_HOUR, 0, 0)
+            next_date = last_dt.date() + datetime.timedelta(days=stride_days)
+            next_dt = datetime(next_date.year, next_date.month, next_date.day, self._ANCHOR_HOUR, 0, 0)
+
+            slot_key = f"{key}:{last_dt.strftime('%Y%m%d%H')}"
+            return last_dt, next_dt, slot_key
     # ----- lifecycle -----
     def _track_task(self, coro, name: str):
         async def _runner():
@@ -1315,105 +1390,74 @@ class SolarSmartAsyncManager:
         days = max(1, int(math.ceil(float(horizon_mins) / 1440.0)))
         return days
 
-
+        # Replace the entire body of _maybe_rollover_quota with this version
     def _maybe_rollover_quota(self, dev: indigo.Device, props: dict, now_ts: float = None):
         """
-        If the configured quota window has elapsed since QuotaAnchorTs,
-        reset RuntimeQuotaMins to 0 and advance the anchor by whole windows.
-        Updates RemainingQuotaMins from maxRuntimePerQuotaMins.
+            Align quota window to fixed LOCAL slots (06:00-based):
+              - 12h: 06:00 and 18:00 daily
+          - 24h/1d: 06:00 daily
+          - 2d/3d: 06:00 every N days (anchored to a fixed base date)
+
+        Resets served minutes and cosmetic counters ONCE per slot.
+        Does not wipe counters on restart if we are still in the same slot.
         """
         try:
-            now_ts = now_ts or time.time()
             st = self.plugin._load_state.setdefault(dev.id, {})
-            # Ensure we have an anchor (hydrate should have done this, but be safe)
-            anchor = st.get("quota_anchor_ts")
-            if anchor is None:
-                anchor = now_ts
-                st["quota_anchor_ts"] = anchor
-                dev.updateStateOnServer("QuotaAnchorTs", f"{anchor:.3f}")
+            # Compute current aligned slot
+            last_dt, next_dt, slot_key = self._aligned_last_next_slot(props, now=datetime.now())
+            last_ts = last_dt.timestamp()
+            next_ts = next_dt.timestamp()
 
-            window_min = self._quota_window_minutes(props)
-            if window_min <= 0:
+            # Ensure anchor exists and is inside the current slot bounds
+            anchor = st.get("quota_anchor_ts")
+            if anchor is None or not (last_ts <= float(anchor) < next_ts):
+                st["quota_anchor_ts"] = last_ts
+                dev.updateStateOnServer("QuotaAnchorTs", f"{last_ts:.3f}")
+
+            # If we've already applied this slot's reset, nothing to do
+            applied_key = st.get("aligned_slot_key")
+            if applied_key == slot_key:
                 return
 
-            # ----- DAILY 06:00 RESET (once per local day) -----
-            local_now = dt.datetime.now()
-            today_str = local_now.strftime("%Y-%m-%d")
-            reset_dt = local_now.replace(hour=6, minute=0, second=0, microsecond=0)
-            # If we are at/after 06:00 and haven't done today's reset, perform it
-            if local_now >= reset_dt and st.get("day_reset_key") != today_str:
-                # Perform daily reset aligned to 06:00 exactly (not 'now')
-                reset_ts = reset_dt.timestamp()
-                # If we've already advanced the anchor to today's reset (or later), don't reset again on restart.
-                if (st.get("quota_anchor_ts") or 0) >= reset_ts:
-                    # Mark the daily reset as acknowledged for this runtime and continue with normal logic next ticks.
-                    st["day_reset_key"] = today_str
-                    return
+            # Determine if we genuinely advanced into a new slot
+            # If previous anchor (if any) is strictly before current slot start -> reset. Otherwise, first-time init: set key only.
+            prev_anchor = anchor
+            advanced = (prev_anchor is not None) and (float(prev_anchor) < last_ts)
 
-                st["day_reset_key"] = today_str
-                st["quota_anchor_ts"] = reset_ts
-                dev.updateStateOnServer("QuotaAnchorTs", f"{reset_ts:.3f}")
+            # Record current slot key either way
+            st["aligned_slot_key"] = slot_key
 
-                # Quota / runtime counters
-                st["served_quota_mins"] = 0
-                dev.updateStateOnServer("RuntimeQuotaMins", 0)
-                dev.updateStateOnServer("RuntimeWindowMins", 0)
+            if not advanced:
+                # Same slot (likely restart) -> do NOT reset minutes
+                return
 
-                # Catch-up counters
-                st["catchup_run_secs"] = 0.0
-                try:
-                    dev.updateStateOnServer("catchupRunTodayMins", 0)
-                    dev.updateStateOnServer("catchupRunWindowAccumMins", 0)
-                    dev.updateStateOnServer("catchupRemainingTodayMins", 0)   # recalculated next tick
-                    dev.updateStateOnServer("catchupActive", False)
-                except Exception:
-                    pass
-
-                # Refill RemainingQuotaMins from config
-                target = int(props.get("maxRuntimePerQuotaMins") or 0)
-                dev.updateStateOnServer("RemainingQuotaMins", max(0, target))
-
-                self.plugin.logger.info(
-                    f"06:00 daily reset for '{dev.name}': counters cleared; RemainingQuotaMins={target}."
-                )
-                return  # Daily reset done; do not also treat as elapsed-window rollover this tick.
-
-
-            elapsed_min = int((now_ts - anchor) // 60)
-            if elapsed_min < window_min:
-                return  # still inside the current window
-
-            # One or more full windows have elapsed
-            n_windows = elapsed_min // window_min
-            advance_sec = n_windows * window_min * 60
-            new_anchor = anchor + advance_sec
-
-            # Reset served quota to 0 for the new window
+            # We advanced into a new slot -> reset counters
             st["served_quota_mins"] = 0
             dev.updateStateOnServer("RuntimeQuotaMins", 0)
             dev.updateStateOnServer("RuntimeWindowMins", 0)
-            # Reset catch-up run accumulation for new quota window
+
+            # Reset catch-up run accumulation for the new slot
             st["catchup_run_secs"] = 0.0
             try:
                 dev.updateStateOnServer("catchupRunTodayMins", 0)
                 dev.updateStateOnServer("catchupRunWindowAccumMins", 0)
-                # Recompute remaining fallback (will be full target again)
-                dev.updateStateOnServer("catchupRemainingTodayMins", 0)  # will be recalculated next scheduler tick
+                dev.updateStateOnServer("catchupRemainingTodayMins", 0)  # recomputed next tick
+                dev.updateStateOnServer("catchupActive", False)
             except Exception:
                 pass
-            # Recompute remaining from device props
-            target = int(props.get("maxRuntimePerQuotaMins") or 0)
-            remaining = max(0, target)
-            dev.updateStateOnServer("RemainingQuotaMins", remaining)
 
-            # Advance anchor
-            st["quota_anchor_ts"] = new_anchor
-            dev.updateStateOnServer("QuotaAnchorTs", f"{new_anchor:.3f}")
+            # Refill RemainingQuotaMins from device props
+            try:
+                target = int(props.get("maxRuntimePerQuotaMins") or 0)
+            except Exception:
+                target = 0
+            dev.updateStateOnServer("RemainingQuotaMins", max(0, target))
 
             # Friendly log
+            period_key = self._aligned_window_key(props)
             self.plugin.logger.info(
-                f"Quota window reset for '{dev.name}': advanced {n_windows} window(s) of {window_min} min; "
-                f"RemainingQuotaMins set to {remaining}."
+                f"Quota window reset for '{dev.name}': aligned slot={slot_key} (period {period_key}); "
+                f"RemainingQuotaMins set to {target}."
             )
         except Exception:
             self.plugin.logger.exception(f"_maybe_rollover_quota: error on {dev.name}")
@@ -2957,14 +3001,69 @@ class Plugin(indigo.PluginBase):
         """Rebuild in-memory _load_state for a SmartSolar Load from its persisted device states.
            If this load controls a real Indigo device (not an action group), mirror that device's
            onOffState into IsRunning (no actions sent). Otherwise, do NOT resume running on restart.
+
+           This version:
+             • Does NOT clamp served minutes down to target (honors actual run time).
+             • Aligns QuotaAnchorTs to the current 06:00-based slot without wiping runtime.
         """
         if dev.deviceTypeId != "solarsmartLoad":
             return
 
         st = self._load_state.setdefault(dev.id, {})
 
+        # ---------- small local helpers for slot alignment ----------
+        def _aligned_window_key_local(p):
+            q = (p.get("quotaWindow") or "24h").lower()
+            return "24h" if q == "1d" else (q if q in ("12h", "24h", "2d", "3d") else "24h")
+
+        def _aligned_last_next_slot_local(p):
+            now = datetime.now()
+            key = _aligned_window_key_local(p)
+            h6 = datetime(now.year, now.month, now.day, 6, 0, 0)
+
+            if key == "12h":
+                # Slots at 06:00 and 18:00 local
+                slot1, slot2 = h6, h6.replace(hour=18)
+                if now >= slot2:
+                    last_dt = slot2
+                    next_dt = slot1 + dt.timedelta(days=1)  # tomorrow 06:00
+                elif now >= slot1:
+                    last_dt = slot1
+                    next_dt = slot2
+                else:
+                    y = h6 - dt.timedelta(days=1)
+                    last_dt = y.replace(hour=18)
+                    next_dt = h6
+                return last_dt.timestamp(), next_dt.timestamp()
+
+            if key == "24h":
+                # Daily at 06:00 local
+                if now >= h6:
+                    last_dt = h6
+                    next_dt = h6 + dt.timedelta(days=1)
+                else:
+                    last_dt = h6 - dt.timedelta(days=1)
+                    next_dt = h6
+                return last_dt.timestamp(), next_dt.timestamp()
+
+            # Multi-day (2d/3d) at 06:00 anchored to fixed base date for determinism
+            stride = 2 if key == "2d" else 3
+            base_date = datetime(2025, 1, 1, 6, 0, 0).date()
+            today = now.date()
+            days_since = (today - base_date).days
+            bucket = (days_since // stride) * stride
+            start_date = base_date + dt.timedelta(days=bucket)
+            start_dt = datetime(start_date.year, start_date.month, start_date.day, 6, 0, 0)
+            if now >= start_dt:
+                last_dt = start_dt
+            else:
+                prev_date = start_date - dt.timedelta(days=stride)
+                last_dt = datetime(prev_date.year, prev_date.month, prev_date.day, 6, 0, 0)
+            next_dt = last_dt + dt.timedelta(days=stride)
+            return last_dt.timestamp(), next_dt.timestamp()
+
         try:
-            # NEW: ensure Tier and PowerRated are set from props
+            # ---------- Tier and Rated (UI convenience) ----------
             props = dev.pluginProps or {}
             try:
                 tier_val = int(props.get("tier", 2) or 2)
@@ -2977,58 +3076,44 @@ class Plugin(indigo.PluginBase):
             dev.updateStateOnServer("Tier", tier_val)
             dev.updateStateOnServer("PowerRated", rated_val)
 
-
-            # --- Persisted counters / anchors ---
+            # ---------- Persisted counters / anchors ----------
             st["served_quota_mins"] = int(dev.states.get("RuntimeQuotaMins", 0) or 0)
 
             q_ts = dev.states.get("QuotaAnchorTs", "")
-            st["quota_anchor_ts"] = float(q_ts) if q_ts not in ("", None, "") else None
+            st["quota_anchor_ts"] = float(q_ts) if q_ts not in ("", None) else None
 
             s_ts = dev.states.get("LastStartTs", "")
-            st["start_ts"] = float(s_ts) if s_ts not in ("", None, "") else None
+            st["start_ts"] = float(s_ts) if s_ts not in ("", None) else None
 
-            props = dev.pluginProps or {}
-            target = 0
+            # Preferred runtime target (for Remaining computation only)
             try:
-                target = int(props.get("maxRuntimePerQuotaMins") or 0)
+                target_pref = int(props.get("maxRuntimePerQuotaMins") or 0)
             except Exception:
-                target = 0
+                target_pref = 0
 
-            # --- MINIMAL NORMALISATION (overshoot & cosmetic window) ---
-            # Clamp overshoot of served minutes to target so we never hydrate >100%
-            if target > 0 and st["served_quota_mins"] > target:
-                st["served_quota_mins"] = target
-                dev.updateStateOnServer("RuntimeQuotaMins", target)
+            # ---------- Align anchor to current 06:00-based slot (no runtime reset) ----------
+            last_slot_ts, next_slot_ts = _aligned_last_next_slot_local(props)
+            anchor = st.get("quota_anchor_ts")
+            if anchor is None or not (last_slot_ts <= float(anchor) < next_slot_ts):
+                st["quota_anchor_ts"] = last_slot_ts
+                dev.updateStateOnServer("QuotaAnchorTs", f"{last_slot_ts:.3f}")
 
-            if target > 0 and st["served_quota_mins"] >= target:
-                # Refresh anchor so first tick doesn’t treat it as expired.
-                now_ts = time.time()
-                st["quota_anchor_ts"] = now_ts
-                dev.updateStateOnServer("QuotaAnchorTs", f"{now_ts:.3f}")
-
-            # Ensure window runtime state exists (cosmetic)
+            # ---------- Cosmetic runtime window state ----------
             try:
                 run_window = int(dev.states.get("RuntimeWindowMins", 0) or 0)
             except Exception:
                 run_window = 0
             if dev.states.get("RuntimeWindowMins", None) is None:
                 dev.updateStateOnServer("RuntimeWindowMins", run_window)
-
-            # If window runtime > served (after clamp), trim it so the table is consistent
+            # Keep window <= served (for table consistency)
             if run_window > st["served_quota_mins"]:
                 dev.updateStateOnServer("RuntimeWindowMins", st["served_quota_mins"])
 
-            # Recompute RemainingQuotaMins from (target - served) after clamp
-            remaining = max(0, target - st["served_quota_mins"]) if target > 0 else 0
+            # ---------- Remaining (no clamp of served to target) ----------
+            remaining = max(0, target_pref - st["served_quota_mins"]) if target_pref > 0 else 0
             dev.updateStateOnServer("RemainingQuotaMins", remaining)
 
-            # If no anchor yet, create one (do NOT reset served)
-            if st.get("quota_anchor_ts") is None:
-                now_ts = time.time()
-                st["quota_anchor_ts"] = now_ts
-                dev.updateStateOnServer("QuotaAnchorTs", f"{now_ts:.3f}")
-
-            # --- Mirror external device on/off if available ---
+            # ---------- Mirror external device ON/OFF if in device control mode ----------
             ext_on = None
             try:
                 ctrl_mode = (props.get("controlMode") or "").lower()
@@ -3043,18 +3128,16 @@ class Plugin(indigo.PluginBase):
                             ext_on = bool(ext.states.get("onOffState", False))
             except Exception:
                 ext_on = None
+
             inverted = bool(props.get("invertOnOff", False))
             if ext_on is not None:
-
                 logical_on = (not ext_on) if inverted else bool(ext_on)
-
                 st["IsRunning"] = logical_on
                 if logical_on:
                     dev.updateStateOnServer("IsRunning", True)
-                    status_word = "CONSUMING" if inverted else "RUNNING"
-                    dev.updateStateOnServer("Status", status_word)
+                    dev.updateStateOnServer("Status", "CONSUMING" if inverted else "RUNNING")
                     dev.updateStateOnServer("LastReason", "Hydrate from external onOffState")
-                    # Seed start_ts if device ON but we had none
+                    # Seed start_ts if ON but missing
                     if not st.get("start_ts"):
                         now_ts = time.time()
                         st["start_ts"] = now_ts
@@ -3064,30 +3147,27 @@ class Plugin(indigo.PluginBase):
                                 f"Hydrate: seeded start_ts for {dev.name} because external device is ON without persisted LastStartTs")
                 else:
                     dev.updateStateOnServer("IsRunning", False)
-                    status_word = "SAVING" if inverted else "OFF"
-                    dev.updateStateOnServer("Status", status_word)
+                    dev.updateStateOnServer("Status", "SAVING" if inverted else "OFF")
                     dev.updateStateOnServer("LastReason", "Hydrate from external onOffState")
             else:
                 st["IsRunning"] = False
                 dev.updateStateOnServer("IsRunning", False)
-                status_word = "SAVING" if inverted else "OFF"
-                dev.updateStateOnServer("Status", status_word)
+                dev.updateStateOnServer("Status", "SAVING" if inverted else "OFF")
                 if not dev.states.get("LastReason"):
                     dev.updateStateOnServer("LastReason", "Plugin restart recovery")
 
-            # Hydrate manual override persistence
+            # ---------- Hydrate manual override ----------
             try:
                 raw_until = dev.states.get("overrideUntilTs", "")
                 if raw_until:
                     self._load_state.setdefault(dev.id, {})["override_until_ts"] = float(raw_until)
-                    # Ensure overrideActive matches current time
-                    active, _ = self._override_status(dev)
+                    active, _ = self._override_status(dev)  # also clears if expired
                     if active and getattr(self, "debug2", False):
                         self.logger.debug(f"Hydrated manual override active for {dev.name}")
             except Exception:
                 pass
 
-            # Catch-up run secs rehydrate
+            # ---------- Hydrate catch-up run seconds ----------
             try:
                 cur_cu_run = int(dev.states.get("catchupRunTodayMins", 0) or 0)
                 st.setdefault("catchup_run_secs", cur_cu_run * 60)
@@ -3096,14 +3176,14 @@ class Plugin(indigo.PluginBase):
 
             if getattr(self, "debug2", False):
                 self.logger.debug(
-                    f"Hydrated {dev.name}: served={st['served_quota_mins']}m (target={target}m), "
+                    f"Hydrated {dev.name}: served={st['served_quota_mins']}m (target={target_pref}m), "
                     f"remaining={dev.states.get('RemainingQuotaMins')}m, "
                     f"windowRun={dev.states.get('RuntimeWindowMins')}m, "
                     f"anchor={st['quota_anchor_ts']}, start_ts={st.get('start_ts')}, "
                     f"IsRunning={st.get('IsRunning')} (ext_on={ext_on})"
                 )
 
-            # Update runtime percent / Status (NN%) after adjustments
+            # ---------- Update runtime percent / Status (NN%) ----------
             try:
                 if hasattr(self, "_ss_manager"):
                     self._ss_manager._update_runtime_progress(dev)
