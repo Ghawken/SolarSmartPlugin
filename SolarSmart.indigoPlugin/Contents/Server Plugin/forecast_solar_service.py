@@ -14,8 +14,7 @@ import json
 import logging
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, Any, List
-from datetime import datetime, timezone
-
+from datetime import datetime, timezone, timedelta
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
 except Exception:
@@ -168,22 +167,25 @@ class ForecastSolarClient:
         return f"{self.BASE_URL}/{plane.latitude}/{plane.longitude}/{plane.dec_deg}/{plane.az_deg}/{plane.kwp}?time=utc"
 
     def _system_local_tz(self):
-        # Fallback for platforms without zoneinfo config
-        if ZoneInfo:
-            try:
-                # Attempt to detect via /etc/localtime symlink (zoneinfo usually handles this automatically)
-                return ZoneInfo(time.tzname[0])
-            except Exception:
-                pass
-        # Ultimate fallback: fixed offset (NOT DST-aware). Better to warn.
+        """
+        Best-effort local timezone:
+        - Prefer the system's current local tzinfo (DST-aware).
+        - Fallback to a fixed-offset tz if zoneinfo config is unavailable.
+        """
+        # Prefer system-reported local tz (DST-aware)
+        try:
+            tz = datetime.now().astimezone().tzinfo
+            if tz is not None:
+                return tz
+        except Exception:
+            pass
+
+        # Fixed-offset fallback (NOT DST-aware)
         offset_sec = -time.timezone
         if time.daylight and time.localtime().tm_isdst == 1:
             offset_sec = -time.altzone
-        sign = "+" if offset_sec >= 0 else "-"
-        hh = abs(offset_sec) // 3600
-        mm = (abs(offset_sec) % 3600) // 60
         log.warning("Falling back to fixed-offset local timezone; DST changes will not be reflected.")
-        return timezone(datetime.strptime(f"{sign}{hh:02d}{mm:02d}", "%z").tzinfo.utcoffset(None))
+        return timezone(timedelta(seconds=offset_sec))
 
     def _rate_limit_error(self, resp: requests.Response) -> ForecastSolarRateLimitError:
         try:

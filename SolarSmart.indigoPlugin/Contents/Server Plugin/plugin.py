@@ -2307,7 +2307,7 @@ class SolarSmartAsyncManager:
             target = int(props.get("maxRuntimePerQuotaMins") or 0)
             dev.updateStateOnServer("RemainingQuotaMins", target if target > 0 else 0)
             dev.updateStateOnServer("RuntimeWindowMins", 0)
-            if getattr(self, "debug2", False):
+            if getattr(self.plugin, "debug2", False):
                 self.plugin.logger.debug(f"{dev.name}: quota window rolled over, counters reset")
 
     # ========== Actuation wrappers ==========
@@ -2726,15 +2726,6 @@ class Plugin(indigo.PluginBase):
         if self.debugLevel >= 2:
             self.debugLog(u"__del__ method called.")
         indigo.PluginBase.__del__(self)
-
-    def _pint(self, val, default=None):
-        try:
-            s = (val or "").strip()
-            if s == "" and default is not None:
-                return default
-            return int(round(float(s)))
-        except Exception:
-            return default
 
     def _pint(self, val, default=None):
         try:
