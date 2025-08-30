@@ -299,6 +299,23 @@ class SolarSmartAsyncManager:
         self._tasks.append(task)
         return task
 
+        # 1) Add this helper inside class SolarSmartAsyncManager (right after _aligned_last_next_slot)
+
+    def _is_final_catchup_phase(self, props: dict, now: datetime | None = None) -> bool:
+        """
+        Return True if we are within the FINAL 24 hours of the current aligned quota slot.
+        - For 12h/24h windows: always True (entire slot is the final period).
+        - For 2d/3d windows: True only when now >= next_slot_start - 24h.
+        """
+        now = now or datetime.now()
+        key = self._aligned_window_key(props)
+        if key in ("12h", "24h"):
+            return True
+        # Multi-day windows: allow catch-up only in the last 24h before the slot boundary
+        last_dt, next_dt, _ = self._aligned_last_next_slot(props, now=now)
+        return now >= (next_dt - dt.timedelta(days=1))
+
+    ################################################################################
     def _aligned_window_key(self, props: dict) -> str:
         """Normalize the configured quota window to a canonical key."""
         period = (props.get("quotaWindow") or "24h").lower()
@@ -761,6 +778,7 @@ class SolarSmartAsyncManager:
                     start_t = self._parse_hhmm(props.get("catchupWindowStart", "00:00"))
                     end_t = self._parse_hhmm(props.get("catchupWindowEnd", "06:00"))
                     in_window = self._time_in_window(now_t, start_t, end_t)
+                    final_phase = self._is_final_catchup_phase(props, now)
                     active = bool(st.get("catchup_active"))
                     is_running = self._is_running(d)
 
@@ -778,7 +796,7 @@ class SolarSmartAsyncManager:
                         self.plugin.logger.debug(
                             f"[CATCHUP][EVAL] {d.name} tier={tier} served={served}m "
                             f"target={catchup_target}m remaining={remaining_fallback}m "
-                            f"active={active} running={is_running} inWindow={in_window} "
+                            f"active={active} running={is_running} inWindow={in_window} finalPhase={final_phase} "
                             f"win={start_t.strftime('%H:%M')}-{end_t.strftime('%H:%M')} "
                             f"catchupRun={catchup_run_mins}m"
                         )
@@ -804,6 +822,13 @@ class SolarSmartAsyncManager:
                             if dbg5:
                                 self.plugin.logger.debug(
                                     f"[CATCHUP][STOP] {d.name}: window closed remaining={remaining_fallback}m"
+                                )
+                            continue
+                        if not final_phase:
+                            total_skipped += 1
+                            if dbg5:
+                                self.plugin.logger.debug(
+                                    f"[CATCHUP][SKIP] {d.name}: not in final slot-day; will wait to end-of-window"
                                 )
                             continue
                         # Still running & needed
@@ -1477,7 +1502,7 @@ class SolarSmartAsyncManager:
                     cu_start = self._parse_hhmm(props.get("catchupWindowStart", "00:00"))
                     cu_end = self._parse_hhmm(props.get("catchupWindowEnd", "06:00"))
                     now_time = now.time()
-                    if self._time_in_window(now_time, cu_start, cu_end):
+                    if self._time_in_window(now_time, cu_start, cu_end) and self._is_final_catchup_phase(props, now):
                         cu_raw = int(props.get("catchupRuntimeMins") or 0)  # DO NOT cap to preferred window
                         served = self._served_quota_mins(dev)
                         if cu_raw > served:
