@@ -301,20 +301,6 @@ class SolarSmartAsyncManager:
 
         # 1) Add this helper inside class SolarSmartAsyncManager (right after _aligned_last_next_slot)
 
-    def _is_final_catchup_phase(self, props: dict, now: datetime | None = None) -> bool:
-        """
-        Return True if we are within the FINAL 24 hours of the current aligned quota slot.
-        - For 12h/24h windows: always True (entire slot is the final period).
-        - For 2d/3d windows: True only when now >= next_slot_start - 24h.
-        """
-        now = now or datetime.now()
-        key = self._aligned_window_key(props)
-        if key in ("12h", "24h"):
-            return True
-        # Multi-day windows: allow catch-up only in the last 24h before the slot boundary
-        last_dt, next_dt, _ = self._aligned_last_next_slot(props, now=now)
-        return now >= (next_dt - dt.timedelta(days=1))
-
     # Insert these helpers inside class SolarSmartAsyncManager, near the other slot helpers.
 
     def _catchup_window_key(self, props: dict) -> str:
@@ -927,7 +913,12 @@ class SolarSmartAsyncManager:
                                     f"[CATCHUP][STOP] {d.name}: window closed remaining={remaining_fallback}m"
                                 )
                             continue
+
                         if not final_phase:
+                            self._ensure_off(d,"Catch-up not allowed until final day of catch-up window")
+                            st["catchup_active"] = False
+                            d.updateStateOnServer("catchupActive", False)
+                            d.updateStateOnServer("catchupLastStop", now.strftime("%Y-%m-%d %H:%M:%S"))
                             total_skipped += 1
                             if dbg5:
                                 self.plugin.logger.debug(
@@ -969,6 +960,12 @@ class SolarSmartAsyncManager:
                             self.plugin.logger.debug(
                                 f"[CATCHUP][SKIP] {d.name}: outside window remaining={remaining_fallback}m"
                             )
+                        continue
+
+                    if not final_phase:
+                        total_skipped += 1
+                        if dbg5:
+                            self.plugin.logger.debug(f"[CATCHUP][SKIP] {d.name}: not in final slot-day; will wait to end-of-window")
                         continue
 
                     # NEW: respect cooldown for catch-up starts

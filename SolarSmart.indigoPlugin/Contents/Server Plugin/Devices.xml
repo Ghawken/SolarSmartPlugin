@@ -343,10 +343,18 @@ and logical running state is true while the physical device is OFF
     </Field>
 
     <!-- Quota window -->
-    <Field id="quotaHeader" type="label" fontColor="black" fontSize="medium">
-      <Label>Quota Window (rolling):</Label>
+    <Field id="quotaHeader" type="label" fontColor="black" fontSize="medium" alwaysUseInDialogHeightCalc="true">>
+      <Label>Quota Window (06:00-aligned):</Label>
     </Field>
-    <Field id="quotaWindow" type="menu" defaultValue="24h">
+
+      <!-- INSERT this hint right after maxRuntimePerQuotaMins -->
+<Field id="quota_hint" type="label" fontColor="blue" fontSize="small" alwaysUseInDialogHeightCalc="true">
+  <Label>
+Preferred/runtime windows are aligned to local 06:00. For example, a 24h window runs 06:00 → 06:00 the next day.
+Multi‑day windows (2–3 days) also start at 06:00. We count preferred runtime minutes within this period.
+  </Label>
+</Field>
+    <Field id="quotaWindow" type="menu" defaultValue="24h" alwaysUseInDialogHeightCalc="true">>
       <Label>Quota Period:</Label>
       <List>
         <Option value="12h">12 hours</Option>
@@ -356,7 +364,7 @@ and logical running state is true while the physical device is OFF
         <Option value="3d">3 days</Option>
       </List>
     </Field>
-    <Field id="maxRuntimePerQuotaMins" type="textfield" defaultValue="180">
+    <Field id="maxRuntimePerQuotaMins" type="textfield" defaultValue="180" alwaysUseInDialogHeightCalc="true">>
       <Label>Max Runtime per Quota Window (minutes):</Label>
     </Field>
 
@@ -369,7 +377,7 @@ and logical running state is true while the physical device is OFF
      <Field id="sep_catchup" type="separator"/>
 
 
-<Field id="enableCatchup" type="checkbox" defaultValue="false">
+<Field id="enableCatchup" type="checkbox" defaultValue="false" alwaysUseInDialogHeightCalc="true">>
     <Label>Enable Scheduled Catch-up</Label>
     <Description></Description>
 </Field>
@@ -382,7 +390,7 @@ If this amount is already met in Runtime above, no CatchUp will occur.</Label>
     </Field>
 
             <!-- NEW: Catch-up window period (independent of runtime/quota window) -->
-      <Field id="catchupWindowPeriod" type="menu" defaultValue="">
+      <Field id="catchupWindowPeriod" type="menu" defaultValue="" alwaysUseInDialogHeightCalc="true">>
         <Label>Catch-up Window Period (optional):</Label>
         <Description>If blank, uses the Runtime Quota Period above. Otherwise aligns to 06:00 for 12h/24h/1–3 day slots.</Description>
         <List>
@@ -395,17 +403,25 @@ If this amount is already met in Runtime above, no CatchUp will occur.</Label>
         </List>
       </Field>
 
-<Field id="catchupWindowStart" type="textfield" defaultValue="00:00">
+<Field id="catchupWindowStart" type="textfield" defaultValue="00:00" alwaysUseInDialogHeightCalc="true">>
     <Label>Catch-up Window Start</Label>
     <Description>Start time (HH:MM) for off‑peak catch‑up.</Description>
 </Field>
 
-<Field id="catchupWindowEnd" type="textfield" defaultValue="06:00">
+<Field id="catchupWindowEnd" type="textfield" defaultValue="06:00" alwaysUseInDialogHeightCalc="true">>
     <Label>Catch-up Window End</Label>
     <Description>End time (HH:MM) for off‑peak catch‑up.</Description>
 </Field>
 
-<Field id="catchupRuntimeMins" type="textfield" defaultValue="60">
+      <!-- INSERT this tip in the Catch-up section (e.g., after catchupWindowEnd) -->
+<Field id="catchup_hint2" type="label" fontColor="blue" fontSize="small" alwaysUseInDialogHeightCalc="true">
+  <Label>
+Tip: since this is solar‑based, the ideal Catch‑up Window is overnight (e.g., 00:00–06:00) so any shortfall is made up off‑peak.
+You can set an independent Catch‑up Window Period above if needed.
+  </Label>
+</Field>
+
+<Field id="catchupRuntimeMins" type="textfield" defaultValue="60" alwaysUseInDialogHeightCalc="true">>
     <Label>Catch-up Runtime (mins)</Label>
     <Description>Minimum minutes to run during the catch‑up window if the daily minimum runtime hasn’t been met.</Description>
 </Field>
