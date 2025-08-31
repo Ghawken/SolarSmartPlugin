@@ -315,6 +315,109 @@ class SolarSmartAsyncManager:
         last_dt, next_dt, _ = self._aligned_last_next_slot(props, now=now)
         return now >= (next_dt - dt.timedelta(days=1))
 
+    # Insert these helpers inside class SolarSmartAsyncManager, near the other slot helpers.
+
+    def _catchup_window_key(self, props: dict) -> str:
+        """
+        Normalize the configured catch-up window period to a canonical key.
+        If not set, default to the quota/runtime window period for backward compatibility.
+        """
+        # Accept same values as quotaWindow; treat "" or None as "same as quota"
+        raw = (props.get("catchupWindowPeriod") or "").lower().strip()
+        if raw in ("12h", "24h", "1d", "2d", "3d"):
+            if raw == "1d":
+                raw = "24h"
+            return raw
+        # Fallback to quota window key
+        return self._aligned_window_key(props)
+
+    def _aligned_last_next_cu_slot(self, props: dict, now: datetime | None = None) -> tuple[
+        datetime, datetime, str]:
+        """
+        Same as _aligned_last_next_slot but using the catch-up window period
+        (independent from the quota/runtime window).
+        """
+        now = now or datetime.now()
+        key = self._catchup_window_key(props)
+        # Reuse the existing quota-slot function by passing a temp props dict
+        tmp_props = {"quotaWindow": key}
+        last_dt, next_dt, _slot_key = self._aligned_last_next_slot(tmp_props, now=now)
+        slot_key = f"CU:{key}:{last_dt.strftime('%Y%m%d%H')}"
+        return last_dt, next_dt, slot_key
+
+    def _is_final_catchup_phase(self, props: dict, now: datetime | None = None) -> bool:
+        """
+        True if we are within the FINAL 24 hours of the current CATCH-UP window slot.
+        - For 12h/24h slots: always True.
+        - For 2d/3d slots: True only when now >= next_slot_start - 24h.
+        """
+        now = now or datetime.now()
+        key = self._catchup_window_key(props)
+        if key in ("12h", "24h"):
+            return True
+        last_dt, next_dt, _ = self._aligned_last_next_cu_slot(props, now=now)
+        return now >= (next_dt - dt.timedelta(days=1))
+
+    # --- Catch-up window runtime counters (independent of quota window) ---
+
+    def _served_catchup_mins(self, dev: indigo.Device) -> int:
+        st = self.plugin._load_state.setdefault(dev.id, {})
+        return int(st.get("served_cu_mins", 0))
+
+    def _set_served_catchup_mins(self, dev: indigo.Device, minutes: int):
+        st = self.plugin._load_state.setdefault(dev.id, {})
+        val = int(minutes)
+        st["served_cu_mins"] = val
+        try:
+            dev.updateStateOnServer("RuntimeCatchupMins", val)
+        except Exception:
+            pass
+
+    def _add_served_catchup_minutes(self, dev: indigo.Device, minutes: int):
+        self._set_served_catchup_mins(dev, self._served_catchup_mins(dev) + int(minutes))
+
+    def _maybe_rollover_catchup_window(self, dev: indigo.Device, props: dict, now_ts: float | None = None):
+        """
+        Align catch-up runtime window to fixed LOCAL slots (06:00-based), using catchupWindowPeriod.
+        Resets served_cu_mins ONCE per slot.
+        Does not wipe minutes on restart within the same slot.
+        """
+        try:
+            now_dt = datetime.now()
+            st = self.plugin._load_state.setdefault(dev.id, {})
+            last_dt, next_dt, slot_key = self._aligned_last_next_cu_slot(props, now=now_dt)
+            last_ts = last_dt.timestamp()
+            next_ts = next_dt.timestamp()
+
+            anchor = st.get("cu_anchor_ts")
+            if anchor is None or not (last_ts <= float(anchor) < next_ts):
+                st["cu_anchor_ts"] = last_ts
+                dev.updateStateOnServer("CatchupAnchorTs", f"{last_ts:.3f}")
+
+            applied_key = st.get("cu_aligned_slot_key")
+            if applied_key == slot_key:
+                return
+
+            prev_anchor = anchor
+            advanced = (prev_anchor is not None) and (float(prev_anchor) < last_ts)
+            st["cu_aligned_slot_key"] = slot_key
+
+            if not advanced:
+                return
+
+            # New slot → reset catch-up window minutes
+            st["served_cu_mins"] = 0
+            dev.updateStateOnServer("RuntimeCatchupMins", 0)
+
+            # Note: we intentionally DO NOT reset catchup_run_secs here; that counter
+            # measures time under catchup_active. If you want it to be catch-up window
+            # scoped, move its reset from _maybe_rollover_quota to here.
+            if getattr(self.plugin, "debug2", False):
+                self.plugin.logger.debug(
+                    f"{dev.name}: catch-up window rolled over (slot={slot_key}); counters reset")
+        except Exception:
+            self.plugin.logger.exception(f"_maybe_rollover_catchup_window: error on {dev.name}")
+
     ################################################################################
     def _aligned_window_key(self, props: dict) -> str:
         """Normalize the configured quota window to a canonical key."""
@@ -756,7 +859,7 @@ class SolarSmartAsyncManager:
                         continue
 
                     # Compute remaining catch-up against Served (RuntimeQuotaMins)
-                    served = self._served_quota_mins(d)
+                    served = self._served_catchup_mins(d)
                     remaining_fallback = max(0, catchup_target - served)
 
                     # Honor Manual Override: do not start/stop under override
@@ -1034,6 +1137,7 @@ class SolarSmartAsyncManager:
                 continue
             props = dev.pluginProps or {}
             self._ensure_quota_anchor(dev, props, now_ts)
+            self._maybe_rollover_catchup_window(dev, props, now_ts)
 
             st = self.plugin._load_state.setdefault(dev.id, {})
 
@@ -1053,6 +1157,7 @@ class SolarSmartAsyncManager:
 
             # 1. Quota minutes
             self._add_served_minutes(dev, add_m)
+            self._add_served_catchup_minutes(dev, add_m)
 
             # 2. Window runtime minutes (purely cosmetic)
             try:
@@ -1503,9 +1608,10 @@ class SolarSmartAsyncManager:
                     cu_end = self._parse_hhmm(props.get("catchupWindowEnd", "06:00"))
                     now_time = now.time()
                     if self._time_in_window(now_time, cu_start, cu_end) and self._is_final_catchup_phase(props, now):
-                        cu_raw = int(props.get("catchupRuntimeMins") or 0)  # DO NOT cap to preferred window
-                        served = self._served_quota_mins(dev)
-                        if cu_raw > served:
+                        cu_raw = int(props.get("catchupRuntimeMins") or 0)
+                        # Use catch-up window served minutes
+                        served_cu = self._served_catchup_mins(dev)
+                        if cu_raw > served_cu:
                             catchup_override = True
             except Exception:
                 catchup_override = False
@@ -1774,6 +1880,7 @@ class SolarSmartAsyncManager:
             for d in devs:
                 props = d.pluginProps or {}
                 self._maybe_rollover_quota(d, props, now_ts)
+                self._maybe_rollover_catchup_window(d, props, now_ts)
 
         pv, con, bat, hdrm, ts = self._snapshot_main_metrics()
         headroom_w = hdrm if hdrm is not None else 0
@@ -3081,6 +3188,17 @@ class Plugin(indigo.PluginBase):
             q_ts = dev.states.get("QuotaAnchorTs", "")
             st["quota_anchor_ts"] = float(q_ts) if q_ts not in ("", None) else None
 
+            # NEW: Catch-up window persisted minutes and anchor
+            try:
+                st["served_cu_mins"] = int(dev.states.get("RuntimeCatchupMins", 0) or 0)
+            except Exception:
+                st["served_cu_mins"] = 0
+            cu_ts = dev.states.get("CatchupAnchorTs", "")
+            st["cu_anchor_ts"] = float(cu_ts) if cu_ts not in ("", None) else None
+
+            s_ts = dev.states.get("LastStartTs", "")
+            st["start_ts"] = float(s_ts) if s_ts not in ("", None) else None
+
             s_ts = dev.states.get("LastStartTs", "")
             st["start_ts"] = float(s_ts) if s_ts not in ("", None) else None
 
@@ -3096,6 +3214,62 @@ class Plugin(indigo.PluginBase):
             if anchor is None or not (last_slot_ts <= float(anchor) < next_slot_ts):
                 st["quota_anchor_ts"] = last_slot_ts
                 dev.updateStateOnServer("QuotaAnchorTs", f"{last_slot_ts:.3f}")
+
+            # ---------- Align catch-up anchor to current catch-up slot (no runtime reset) ----------
+            try:
+                # local helper mirroring _aligned_last_next_cu_slot (uses catchupWindowPeriod or quotaWindow)
+                def _aligned_last_next_cu_slot_local(p):
+                    # derive key (fallback to quota window)
+                    raw = (p.get("catchupWindowPeriod") or "").lower().strip()
+                    if raw in ("12h", "24h", "1d", "2d", "3d"):
+                        key = "24h" if raw == "1d" else raw
+                    else:
+                        key = _aligned_window_key_local(p)
+                    # reuse aligned logic
+                    now_l = datetime.now()
+                    h6 = datetime(now_l.year, now_l.month, now_l.day, 6, 0, 0)
+                    if key == "12h":
+                        slot1, slot2 = h6, h6.replace(hour=18)
+                        if now_l >= slot2:
+                            last_dt = slot2;
+                            next_dt = slot1 + dt.timedelta(days=1)
+                        elif now_l >= slot1:
+                            last_dt = slot1;
+                            next_dt = slot2
+                        else:
+                            y = h6 - dt.timedelta(days=1)
+                            last_dt = y.replace(hour=18);
+                            next_dt = h6
+                    elif key == "24h":
+                        if now_l >= h6:
+                            last_dt = h6;
+                            next_dt = h6 + dt.timedelta(days=1)
+                        else:
+                            last_dt = h6 - dt.timedelta(days=1);
+                            next_dt = h6
+                    else:
+                        stride = 2 if key == "2d" else 3
+                        base_date = datetime(2025, 1, 1, 6, 0, 0).date()
+                        today = now_l.date()
+                        days_since = (today - base_date).days
+                        bucket = (days_since // stride) * stride
+                        start_date = base_date + dt.timedelta(days=bucket)
+                        start_dt = datetime(start_date.year, start_date.month, start_date.day, 6, 0, 0)
+                        if now_l >= start_dt:
+                            last_dt = start_dt
+                        else:
+                            prev_date = start_date - dt.timedelta(days=stride)
+                            last_dt = datetime(prev_date.year, prev_date.month, prev_date.day, 6, 0, 0)
+                        next_dt = last_dt + dt.timedelta(days=stride)
+                    return last_dt.timestamp(), next_dt.timestamp()
+
+                cu_last_ts, cu_next_ts = _aligned_last_next_cu_slot_local(props)
+                cu_anchor = st.get("cu_anchor_ts")
+                if cu_anchor is None or not (cu_last_ts <= float(cu_anchor) < cu_next_ts):
+                    st["cu_anchor_ts"] = cu_last_ts
+                    dev.updateStateOnServer("CatchupAnchorTs", f"{cu_last_ts:.3f}")
+            except Exception:
+                pass
 
             # ---------- Cosmetic runtime window state ----------
             try:

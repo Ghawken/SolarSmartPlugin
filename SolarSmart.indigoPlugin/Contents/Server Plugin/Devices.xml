@@ -380,6 +380,21 @@ If runtime not completed in window time period, Force ON during this window.
 The maximum time specified here is the total time run that is needed to catch up.
 If this amount is already met in Runtime above, no CatchUp will occur.</Label>
     </Field>
+
+            <!-- NEW: Catch-up window period (independent of runtime/quota window) -->
+      <Field id="catchupWindowPeriod" type="menu" defaultValue="">
+        <Label>Catch-up Window Period (optional):</Label>
+        <Description>If blank, uses the Runtime Quota Period above. Otherwise aligns to 06:00 for 12h/24h/1–3 day slots.</Description>
+        <List>
+          <Option value="">(same as Quota Period)</Option>
+          <Option value="12h">12 hours</Option>
+          <Option value="24h">24 hours</Option>
+          <Option value="1d">1 day</Option>
+          <Option value="2d">2 days</Option>
+          <Option value="3d">3 days</Option>
+        </List>
+      </Field>
+
 <Field id="catchupWindowStart" type="textfield" defaultValue="00:00">
     <Label>Catch-up Window Start</Label>
     <Description>Start time (HH:MM) for off‑peak catch‑up.</Description>
@@ -450,6 +465,16 @@ If this amount is already met in Runtime above, no CatchUp will occur.</Label>
       <TriggerLabel>Rated power changed</TriggerLabel>
       <ControlPageLabel>Rated W</ControlPageLabel>
     </State>
+            <State id="RuntimeCatchupMins">
+        <ValueType>Integer</ValueType>
+        <TriggerLabel>Catch-up window runtime changed</TriggerLabel>
+        <ControlPageLabel>Runtime (catch-up window, min)</ControlPageLabel>
+      </State>
+      <State id="CatchupAnchorTs">
+        <ValueType>String</ValueType>
+        <TriggerLabel>Catch-up Anchor (epoch)</TriggerLabel>
+        <ControlPageLabel>Catch-up Anchor (epoch)</ControlPageLabel>
+      </State>
 <!-- Add under <Device id="solarsmartLoad"> ... <States> -->
 <State id="overrideActive">
   <ValueType>Boolean</ValueType>
