@@ -2,7 +2,41 @@
 
 ![](https://github.com/Ghawken/SolarSmartPlugin/blob/main/SolarSmart.indigoPlugin/Resources/icon.png?raw=true "SolarSmart Plugin Icon")
 
-Harness your surplus solar energy automatically. SolarSmart monitors your photovoltaic (PV) production, site consumption, battery power, and/or net grid flow to calculate “headroom” (excess power) and then starts or sheds discretionary loads in a priority order so you use more of your own clean energy and import less from the grid.
+Harness your surplus solar energy automatically. SolarSmart monitors your photovoltaic (PV) production, site consumption, battery power, and/or net grid flow to calculate “headroom” (excess power)[...]
+
+---
+
+## What’s New
+
+The following improvements and fixes have landed since the last README update. These notes reflect version 1.0.70 (commit f7fdad16 on main).
+
+- 06:00‑aligned preferred runtime windows
+  - Quota/Preferred runtime windows now align to local 06:00 for determinism (no rolling drift).
+  - 12h: 06:00–18:00 and 18:00–06:00; 24h/1d: 06:00–06:00 next day; 2–3 day windows start at 06:00 every N days.
+  - Counters reset exactly once at slot boundaries and survive restarts within a slot.
+
+- Independent Catch‑up Window Period (optional)
+  - New per‑load option: Catch‑up Window Period can be set independently of the Quota Period.
+  - Runtime now accrues into two windows in parallel:
+    - Preferred runtime window: mirrored in RuntimeQuotaMins, resets per quota period.
+    - Catch‑up window: mirrored in RuntimeCatchupMins, resets per catch‑up period.
+  - Catch‑up only forces starts inside the daily catch‑up time window (e.g., 00:00–06:00).
+  - For 2–3 day catch‑up periods, forcing is deferred until the final 24 hours of the catch‑up slot.
+  - New load states:
+    - RuntimeCatchupMins (minutes accumulated within the catch‑up window)
+    - CatchupAnchorTs (epoch at the start of the current catch‑up slot)
+
+- Forecast.Solar client robustness
+  - Local timezone handling hardened (DST‑aware); safe fixed‑offset fallback if IANA data unavailable.
+  - Local‑day aggregation and compact summaries; on‑disk cache (~1 hour) to respect rate limits.
+
+- Grid‑only mode and Test Source
+  - Grid‑only mode uses net grid power exclusively: Headroom = −GridPower (W).
+  - Test Source can override the Main device; when “Use Grid Data Only” is checked and Grid Power is provided, PV/Consumption/Battery entries are ignored and headroom derives from grid power only.
+
+Notes:
+- Device UI wording may still refer to “Quota Window (rolling)”; functionally, windows are aligned to 06:00 as described above.
+- Existing images and their locations (Images/…) are unchanged.
 
 ---
 
@@ -197,24 +231,34 @@ Note: Field names may vary slightly by version.
 - When a load reaches its quota, SolarSmart will not start it again until the quota resets.
 - Use quotas to prioritize limited energy budget across multiple loads (e.g., pool pump max 3h/day; EV charger off-peak window only).
 
+Note:
+- Preferred runtime windows are aligned to local 06:00:
+  - 12h: 06:00–18:00 and 18:00–06:00
+  - 24h/1d: 06:00–06:00 next day
+  - 2–3d: advance at 06:00 every N days
+
 ---
 
 ## 1. Scheduled Catch‑Up (Fallback Runtime)
 
 ### What Problem Does Catch‑Up Solve?
 
-Some devices (pool pumps, chlorinators, ventilation fans, etc.) must run a **minimum amount of time** each quota window (e.g. per day or rolling window) regardless of how much excess solar was actually available.  
+Some devices (pool pumps, chlorinators, ventilation fans, etc.) must run a **minimum amount of time** each quota window (e.g. per day or rolling window) regardless of how much excess solar was actuall[...]
 Scheduled Catch‑Up guarantees a fallback runtime:
 
 - If the device already ran enough minutes naturally (because there was plenty of solar), catch‑up does **nothing**.
 - If it did **not** reach the fallback target, the plugin will force it ON during your defined “catch‑up window” (often overnight / off‑peak) until the shortfall is eliminated.
 
+Update (v1.0.70):
+- Catch‑up Window Period can be set independently of the Quota Period. Minutes accrue in a separate, 06:00‑aligned catch‑up slot (RuntimeCatchupMins).
+- For 2–3 day catch‑up periods, forced catch‑up starts only occur during the final 24 hours of the current catch‑up slot (and still inside the daily catch‑up time window).
+
 ### Key Concepts (Plain English)
 
 | Term | Meaning |
 |------|---------|
-| Catch‑up Runtime (mins) | The fallback minimum you want the load to achieve during the current quota window. |
-| Served (RuntimeQuotaMins) | Total minutes the load has already run this quota window (any reason). |
+| Catch‑up Runtime (mins) | The fallback minimum you want the load to achieve during the current catch‑up window. |
+| Served (RuntimeCatchupMins) | Total minutes the load has already run in the current catch‑up window (any reason). |
 | Remaining Fallback | catchupRuntimeMins − served (never below 0). |
 | catchupActive | True only while the plugin forcibly runs the load to make up the deficit. |
 | Concurrency | Obeys the “Max Concurrent Loads” setting on the Main device. |
@@ -228,7 +272,7 @@ Scheduled Catch‑Up guarantees a fallback runtime:
 | Fallback = 60 min. Device has run 0 min. Window opens. | Plugin starts it (catchupActive = true). |
 | While catch‑up running headroom goes negative. | Catch‑up continues (it ignores headroom) unless concurrency or you manually stop it. |
 | Target reached (Remaining Fallback = 0) before window end. | Plugin stops the load; catchupActive = false. |
-| Window closes with Remaining Fallback > 0. | Plugin stops the load; will try again next catch‑up window if still within quota window. |
+| Window closes with Remaining Fallback > 0. | Plugin stops the load; will try again next catch‑up window if still within the catch‑up period. |
 
 ### How to Enable Catch‑Up
 
@@ -237,6 +281,7 @@ Scheduled Catch‑Up guarantees a fallback runtime:
 3. Set:
    - Catch‑up Runtime (mins) – your fallback target (e.g. 120).
    - Catch‑up Window Start / End – off‑peak hours (e.g. 00:00 → 06:00).
+   - (Optional) Catch‑up Window Period – leave blank to use the quota period, or choose 12h/24h/2d/3d independently.
 4. (Optional) Adjust Max Concurrent Loads on the SolarSmart Main device.
 5. Save. Wait a scheduler tick (default ~60 seconds) or enable high debug to watch immediately.
 
@@ -248,6 +293,7 @@ All must be true:
 - Remaining Fallback > 0.
 - Device is currently OFF.
 - Current time is inside the defined catch‑up window.
+- For multi‑day catch‑up periods (2d/3d): we are in the final 24h of the current catch‑up slot.
 - Concurrency limit not exceeded.
 - Only one catch‑up start per tick (internal safety throttle).
 
@@ -256,8 +302,11 @@ All must be true:
 Catch‑up started device stops when:
 - Remaining Fallback = 0 (target satisfied), **or**
 - Current time exits the catch‑up window, **or**
+- For multi‑day catch‑up: not in the final slot‑day (enforced), **or**
 - You manually turn it OFF, **or**
-- Quota window rolls over (the runtime counters reset), **or**
+- The relevant window rolls over:
+  - If using an independent catch‑up period, the catch‑up window boundary.
+  - Otherwise, at quota window rollover (legacy behavior).
 - Plugin / Indigo restarts (it re‑evaluates next tick).
 
 ### Important Device States (SmartSolar Load)
@@ -265,13 +314,15 @@ Catch‑up started device stops when:
 | State | Description |
 |-------|-------------|
 | `catchupDailyTargetMins` | Exactly the configured fallback (Catch‑up Runtime). |
-| `catchupRemainingTodayMins` | Minutes still needed to satisfy fallback (never negative). |
+| `catchupRemainingTodayMins` | Minutes still needed to satisfy fallback (never negative), computed against the catch‑up window. |
 | `catchupActive` | True only while **plugin‑forced** catch‑up run is in progress. |
 | `catchupRunTodayMins` | Minutes accumulated under catch‑up active time only. |
 | `catchupRunWindowAccumMins` | Mirrors `catchupRunTodayMins` (placeholder). |
 | `catchupLastStart` / `catchupLastStop` | Time stamps (YYYY‑MM‑DD HH:MM:SS) when catch‑up run last began/ended. |
-| `RuntimeQuotaMins` | Total runtime this quota window (all causes). |
-| `RemainingQuotaMins` | Remaining regular (non‑fallback) quota minutes if a max is configured. |
+| `RuntimeCatchupMins` | Total runtime accrued in the current catch‑up window (any reason). |
+| `CatchupAnchorTs` | Epoch marking the start of the current catch‑up slot (06:00‑aligned). |
+| `RuntimeQuotaMins` | Preferred runtime accrued in the quota window (any reason). |
+| `RemainingQuotaMins` | Remaining preferred (non‑fallback) runtime if a max is configured. |
 
 ### Typical Control Page Elements
 
@@ -279,7 +330,8 @@ Catch‑up started device stops when:
 - Fallback Remaining: `catchupRemainingTodayMins`
 - Active Indicator: `catchupActive`
 - Last Start / Last Stop
-- Total Quota Runtime: `RuntimeQuotaMins`
+- Runtime (catch‑up window): `RuntimeCatchupMins`
+- Preferred Runtime (quota window): `RuntimeQuotaMins`
 
 ### Why Isn’t It Starting?
 
@@ -289,6 +341,7 @@ Catch‑up started device stops when:
 | `catchupRuntimeMins` = 0 | No fallback required. |
 | Remaining Fallback = 0 | Already satisfied by normal runtime. |
 | Outside catch‑up window | Wait until window start. |
+| For 2–3 day catch‑up | Not yet in the final day of the catch‑up slot. |
 | Concurrency limit reached | Another load occupies a slot. |
 | Start throttle | One catch‑up start already happened this tick. |
 | Not enough time passed | Wait for the next scheduler interval. |
@@ -440,10 +493,10 @@ Estimate today’s and tomorrow’s PV generation so you can:
 ## FAQs
 
 **Q: Does catch‑up exceed my regular max runtime quota?**  
-A: Catch‑up counts toward the same served minutes. It won’t *ignore* your quota cap; if quota is exhausted the load becomes ineligible and catch‑up won’t start.
+A: Catch‑up counts toward the same served minutes. It won’t ignore your preferred runtime cap: if quota is exhausted, the load is ineligible and catch‑up won’t start.
 
 **Q: Can a load be both normally running and catch‑up active?**  
-A: If it was already ON when deficit existed, it stays a “normal” run (catchupActive stays False). Catch‑up only marks ownership when it *starts* the load.
+A: If it was already ON when deficit existed, it stays a “normal” run (catchupActive stays False). Catch‑up only marks ownership when it starts the load.
 
 **Q: Why is `catchupRunTodayMins` low even though fallback is satisfied?**  
 A: Those minutes count only plugin‑forced (active) time. Normal passive runtime still reduces `catchupRemainingTodayMins` but does not increment the “run under catch‑up” counter.
@@ -482,14 +535,14 @@ Diagnostics tips:
 
 ## Deep Scheduler Diagnostics (Debug Level 7)
 
-When you enable the (very verbose) `debug7` flag in plugin preferences the scheduler emits a structured, multi‑section diagnostic block for each SmartSolar Load every tick. This is intended for advanced troubleshooting of start / stop eligibility, quota rollover, and catch‑up (fallback) behavior.
+When you enable the (very verbose) `debug7` flag in plugin preferences the scheduler emits a structured, multi‑section diagnostic block for each SmartSolar Load every tick. This is intended for adva[...]
 
 Example (actual output):
 
 ```
-════════════════════════════════════════════════════════════════════════════════
+══════════════════════════════════════════════════════════════════��[...]
 🔍 DBG7 Device: SolarSmart Load Pool 2000W No Heater  (id=127719016)  Tier 1
-════════════════════════════════════════════════════════════════════════════════
+══════════════════════════════════════════════════════════════════��[...]
 🧠 Decision
     Status: OFF   Action: SKIP (quota)   Skip: quota
     Headroom Now: -111 W   StartsThisTick: 0   RunningNow: 0
@@ -522,7 +575,7 @@ Example (actual output):
     served_quota_mins: 240
     start_ts: None
     today_key: '2025-08-14'
-────────────────────────────────────────────────────────────────────────────────
+──────────────────────────────────────────────────────────────────��[...]
 ```
 
 ### Section Glossary
@@ -574,7 +627,7 @@ Example (actual output):
 
 5. ⚡ Power & Thresholds  
    - Rated: Configured `ratedWatts`.
-   - Needed (start threshold est): Start trigger threshold = rated * surgeMultiplier * (1 + startMargin%).
+   - Needed (start threshold est): Start trigger threshold = rated * surge * (1 + startMargin%).
    - Surge Mult / Start Margin % / Keep Margin %: Raw configuration used for start/keep decisions.
    - Min / Max Runtime: Per-start run time constraints (minRuntimeMins / maxRuntimeMins).
    - Max Pref Window: `maxRuntimePerQuotaMins` (target for the rolling preferred window).
@@ -731,9 +784,4 @@ We can expand the legend or clarify messages further.
 
 ---
 
-
-## Acknowledgements
-
-- Indigo Domotics for the automation platform.
-- Thanks to solar enthusiasts for real-world scenarios and testing.
 
