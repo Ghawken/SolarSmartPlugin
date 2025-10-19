@@ -1889,7 +1889,11 @@ class SolarSmartAsyncManager:
 
         # Build list of currently running (tier, dev), lowest priority first for shedding
         running_pairs = []
-        for tier, devs in loads_by_tier.items():
+        # Process tiers in priority order, respecting priorities
+        for tier, devs in sorted(loads_by_tier.items()):
+            # Skip this tier if we already started a load this tick
+            if starts_this_tick >= 1:
+                break  # ← ENFORCE: only one START per tick, highest tier wins
             for d in devs:
                 if self._is_running(d):
                     running_pairs.append((tier, d))
