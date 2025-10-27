@@ -1913,7 +1913,7 @@ class SolarSmartAsyncManager:
             )
 
         # If negative headroom, shed exactly ONE load first, then re-evaluate next tick
-        if headroom_w < 0 and running_pairs:
+        if headroom_w < -100 and running_pairs:
             headroom_w = self._shed_until_positive(headroom_w, running_pairs)
 
         # Recompute running count after potential shed
