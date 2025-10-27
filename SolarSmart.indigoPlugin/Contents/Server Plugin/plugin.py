@@ -1870,6 +1870,15 @@ class SolarSmartAsyncManager:
         max_concurrent = self._get_max_concurrent_loads()
         starts_this_tick = 0
         table_rows = []  # for final summary table
+        # Read Main option for priority preempt (optional reclaim)
+        enable_preempt = False
+        try:
+            main_dev = self._get_main_device()
+            if main_dev:
+                mprops = main_dev.pluginProps or {}
+                enable_preempt = bool(mprops.get("enablePriorityPreempt", False))
+        except Exception:
+            enable_preempt = False
 
         # Rollover quota windows if needed (minimal change: just call it)
         now_ts = time.time()
@@ -2034,14 +2043,45 @@ class SolarSmartAsyncManager:
                         running_now=running_now
                     )
                     continue
+                # --- START constraints (device is currently OFF) ---
+                cooldown_ok = self._cooldown_met(d, int(props.get("cooldownMins") or 0))
+                can_run_now = (remaining > 0) and cooldown_ok  # eligible to start if resources allow
 
-            # start constraints
+                # start constraints
                 if starts_this_tick >= 1:
                     action = "SKIP (cap)"
                     status = "OFF"
                 elif running_now >= max_concurrent:
-                    action = "SKIP (conc)"
-                    status = "OFF"
+                    # Try preempt only if enabled and this higher-priority device is eligible
+                    if enable_preempt and can_run_now:
+                        victim = None
+                        victim_tier = None
+                        # running_pairs sorted with highest tier numbers first (lowest priority)
+                        for rtier, rdev in running_pairs:
+                            if rtier <= tier:
+                                continue  # only lower-priority (higher tier number)
+                            if not self._is_running(rdev):
+                                continue
+                            st_v = self.plugin._load_state.get(rdev.id, {}) or {}
+                            ov_active, _ = self.plugin._override_status(rdev)
+                            if ov_active or st_v.get("catchup_active"):
+                                continue
+                            victim = rdev
+                            victim_tier = rtier
+                            break
+                        if victim:
+                            self._ensure_off(victim, f"Preempt lower tier T{victim_tier} for higher priority T{tier}")
+                            running_now = max(0, running_now - 1)
+                            # Take only one action this tick; start will happen next tick
+                            starts_this_tick = 1
+                            action = "SKIP (preempt lower tier)"
+                            status = "OFF"
+                        else:
+                            action = "SKIP (conc)"
+                            status = "OFF"
+                    else:
+                        action = "SKIP (conc)"
+                        status = "OFF"
                 elif remaining <= 0:
                     action = "SKIP (quota)"
                     status = "OFF"
