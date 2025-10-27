@@ -1891,14 +1891,17 @@ class SolarSmartAsyncManager:
         running_pairs = []
         # Process tiers in priority order, respecting priorities
         for tier, devs in sorted(loads_by_tier.items()):
-            # Skip this tier if we already started a load this tick
-            if starts_this_tick >= 1:
-                break  # ← ENFORCE: only one START per tick, highest tier wins
             for d in devs:
                 if self._is_running(d):
                     running_pairs.append((tier, d))
         # Sort so that highest tier numbers (lowest priority) are last
-        running_pairs.sort(key=lambda x: x[0], reverse=False)
+        running_pairs.sort(key=lambda x: x[0], reverse=True)
+
+        if dbg:
+            self.plugin.logger.debug(
+                f"Running loads collected (shedding order): "
+                f"{[(d.name, f'T{t}') for t, d in running_pairs]}"
+            )
 
         # If negative headroom, shed exactly ONE load first, then re-evaluate next tick
         if headroom_w < 0 and running_pairs:
