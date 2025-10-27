@@ -90,8 +90,12 @@
   <Field id="sep_reclaim" type="separator"/>
   <Field id="enablePriorityPreempt" type="checkbox" defaultValue="false">
     <Label>Enable Priority Preempt</Label>
-    <Description>When a higher-priority tier is eligible but blocked (by concurrency or headroom), stop one running load from the highest-numbered tier to make room.</Description>
+
   </Field>
+          <Field id="hint_priro" type="label" fontColor="blue" fontSize="normal" alwaysUseInDialogHeightCalc="true">
+    <Label>When a higher-priority tier is eligible but blocked (by concurrency or headroom),
+stop one running load from the highest-numbered tier to make room.</Label>
+          </Field>
       <!-- ===== Hints ===== -->
       <Field id="sep_hint" type="separator"/>
       <Field id="hint" type="label" fontColor="darkgray" fontSize="small" alwaysUseInDialogHeightCalc="true">
