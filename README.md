@@ -6,9 +6,35 @@ Harness your surplus solar energy automatically. SolarSmart monitors your photov
 
 ---
 
-## What’s New
+### What’s New since 1.0.70 → 1.0.81
 
-The following improvements and fixes have landed since the last README update. These notes reflect version 1.0.70 (commit f7fdad16 on main).
+- Optional Priority Preempt (Main device)
+  - New checkbox: “Enable Priority Preempt”.
+  - When a higher‑priority tier is eligible to start but is blocked by the max concurrent loads cap, the scheduler will stop exactly one running load from the highest‑numbered tier to make room.
+  - Skips loads under Manual Override and those actively running for Catch‑up.
+  - Default: off (preserves existing behavior unless enabled).
+
+- Manual Override for loads
+  - New Actions: “Set Manual Override (suspend control)” and “Clear Manual Override (resume control)”.
+  - New load states: overrideActive, overrideUntil, overrideUntilTs.
+  - While active, the scheduler will not start/stop that load and will avoid shedding it during emergency/preempt logic.
+
+- Inverted/ECO device support (device control mode)
+  - New per‑load option: Invert ON/OFF Logic for devices that consume when their physical device is OFF (e.g., ECO toggles).
+  - Logical RUN maps to physical OFF when inverted; Status shows “CONSUMING” (RUN) vs “SAVING” (OFF).
+  - Scheduler/table annotates device names with “(ECO ON/OFF)” to reflect the physical state.
+  - Actuation commands are inverted accordingly; external state sync mirrors logical running.
+
+- Test Source enhancements
+  - Test device can force Grid‑only simulation (headroom = −GridTestW) independent of Main.
+  - Helper labels and state mirroring (e.g., SolarTestW, GridTestW) for easier Control Page bindings.
+
+- Shedding and priority tweaks
+  - Emergency shedding prefers the lowest‑priority tier and picks the smallest load that covers the deficit when possible, skipping Manual Override and Catch‑up active loads.
+  - Startup hydration and state alignment improved to better survive restarts within a window without wiping counters.
+
+
+### What’s New since 1.0.70 
 
 - 06:00‑aligned preferred runtime windows
   - Quota/Preferred runtime windows now align to local 06:00 for determinism (no rolling drift).
