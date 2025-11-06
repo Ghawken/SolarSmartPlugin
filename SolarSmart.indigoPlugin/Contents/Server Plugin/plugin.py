@@ -1890,7 +1890,7 @@ class SolarSmartAsyncManager:
 
         pv, con, bat, hdrm, ts = self._snapshot_main_metrics()
         headroom_w = hdrm if hdrm is not None else 0
-
+#1.0.82
         dbg = getattr(self.plugin, "debug2", False)
         if dbg:
             self.plugin.logger.debug(f"===== LOAD SCHEDULER TICK =====")
